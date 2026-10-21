@@ -21,3 +21,6 @@ sessions/
 
 # Spike traces (raw EDIABAS/IFH logs)
 spike/traces/
+
+# devtools build output
+devtools/build/
