@@ -15,19 +15,21 @@ sealed class Session : IDisposable
         -- one row per successful job execution; t = when the job started (UTC)
         CREATE TABLE samples (id INTEGER PRIMARY KEY, t TEXT NOT NULL, elapsed_s REAL NOT NULL,
                               cycle INTEGER NOT NULL, job TEXT NOT NULL, ms REAL NOT NULL);
-        -- the job's results, names exactly as the SGBD returns them; numbers in value, strings in text
-        CREATE TABLE readings (sample_id INTEGER NOT NULL REFERENCES samples (id), name TEXT NOT NULL,
-                               value REAL, text TEXT, unit TEXT);
+        -- the job's results, names exactly as the SGBD returns them; numbers in value, strings in text;
+        -- set_index = which result set (1-based; jobs like FS_LESEN return one set per fault)
+        CREATE TABLE readings (sample_id INTEGER NOT NULL REFERENCES samples (id), set_index INTEGER NOT NULL,
+                               name TEXT NOT NULL, value REAL, text TEXT, unit TEXT);
         CREATE INDEX readings_by_name ON readings (name, sample_id);
         -- the telegram exchange behind a natively transported sample (hex, with checksums; times in ms
-        -- from the end of sending the request: echo back, first reply byte, last reply byte)
+        -- from the start of writing the request: echo complete, first reply byte after the echo, reply
+        -- complete; waited_ms = gap waited before sending)
         CREATE TABLE raw (sample_id INTEGER PRIMARY KEY REFERENCES samples (id), request TEXT NOT NULL,
                           response TEXT NOT NULL, echo_ms REAL, first_byte_ms REAL, total_ms REAL, waited_ms REAL);
         -- link_lost, still_down, link_restored, job_error, note
         CREATE TABLE events (id INTEGER PRIMARY KEY, t TEXT NOT NULL, elapsed_s REAL NOT NULL,
                              kind TEXT NOT NULL, job TEXT, detail TEXT);
         CREATE VIEW series AS
-            SELECT s.t, s.elapsed_s, s.job, r.name, r.value, r.text, r.unit
+            SELECT s.t, s.elapsed_s, s.job, r.set_index, r.name, r.value, r.text, r.unit
             FROM readings r JOIN samples s ON s.id = r.sample_id;
         """;
 
@@ -88,7 +90,9 @@ sealed class Session : IDisposable
             : DBNull.Value;
         cmd.Parameters.AddWithValue("$v", stored);
         cmd.ExecuteNonQuery();
-        File.WriteAllText(metaPath, meta.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        // write-then-rename, so a reader (felkod sessions) never sees a half-written file
+        File.WriteAllText(metaPath + ".tmp", meta.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        File.Move(metaPath + ".tmp", metaPath, overwrite: true);
     }
 
     public void AddSample(DateTime t, double elapsed, int cycle, string job, double ms, JsonArray sets, Ds2Exchange? exchange = null)
@@ -104,14 +108,17 @@ sealed class Session : IDisposable
         long id = (long)sample.ExecuteScalar()!;
 
         using var reading = db.CreateCommand();
-        reading.CommandText = "INSERT INTO readings (sample_id, name, value, text, unit) VALUES ($id, $n, $v, $x, $u)";
+        reading.CommandText = "INSERT INTO readings (sample_id, set_index, name, value, text, unit) VALUES ($id, $si, $n, $v, $x, $u)";
         var pName = reading.Parameters.Add("$n", SqliteType.Text);
         var pValue = reading.Parameters.Add("$v", SqliteType.Real);
         var pText = reading.Parameters.Add("$x", SqliteType.Text);
         var pUnit = reading.Parameters.Add("$u", SqliteType.Text);
         reading.Parameters.AddWithValue("$id", id);
+        var pSet = reading.Parameters.Add("$si", SqliteType.Integer);
+        int setIndex = 0;
         foreach (var set in sets.Skip(1))
         {
+            pSet.Value = ++setIndex;
             var obj = set!.AsObject();
             foreach (var (name, node) in obj)
             {

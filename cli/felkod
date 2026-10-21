@@ -57,6 +57,10 @@ def start_daemon(extra_args=()):
         return False
     if not DAEMON.exists():
         raise Failure("daemon_missing", f"{DAEMON} not found; build it with: dotnet build -c Release {REPO / 'daemon'}")
+    extra_args = list(extra_args)
+    # FELKOD_PORT keeps auto-started daemons on a test port (e.g. devtools/fake_ecu.py)
+    if os.environ.get("FELKOD_PORT") and "--port" not in extra_args:
+        extra_args += ["--port", os.environ["FELKOD_PORT"]]
     data_dir().mkdir(parents=True, exist_ok=True)
     log = open(data_dir() / "felkodd.log", "ab")
     subprocess.Popen([str(DAEMON), "--socket", str(socket_path()), *extra_args], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
@@ -107,11 +111,12 @@ WARNINGS = []
 NATIVE_HELP = ("felkodd's own DS2 transport for jobs that send one telegram, decoded by the SGBD; "
                "the raw telegrams are stored in the session's raw table")
 GAP_HELP = "native: ms between a reply and the next request (default 100, BMW's regeneration time for MS43)"
-SESSION_TABLES = ("samples(id, t, elapsed_s, cycle, job, ms); readings(sample_id, name, value, text, unit); "
+SESSION_TABLES = ("samples(id, t, elapsed_s, cycle, job, ms); readings(sample_id, set_index, name, value, text, unit); "
                   "events(id, t, elapsed_s, kind, job, detail); meta(key, value); "
                   "raw(sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms) for native samples; "
-                  "view series(t, elapsed_s, job, name, value, text, unit). t is UTC ISO 8601 at job start; "
-                  "names are the SGBD's result names; events.kind is link_lost, still_down, link_restored or job_error")
+                  "view series(t, elapsed_s, job, set_index, name, value, text, unit). t is UTC ISO 8601 at job start; "
+                  "names are the SGBD's result names; events.kind is link_lost, still_down, link_restored, job_error, "
+                  "not_native or internal_error")
 
 
 def jobs_arg(text):
@@ -140,13 +145,21 @@ def cmd_daemon(args):
     if args.action == "stop":
         if not daemon_running():
             return {"stopped": False, "already_stopped": True}
-        data("daemon.stop")
+        pid = data("status")["daemon"]["pid"]
+        try:
+            data("daemon.stop")
+        except Failure as failure:
+            if failure.code != "daemon_gone":  # it may close the socket before the reply is out
+                raise
+        # done only when the process has exited: it finishes a running session on the way out
         deadline = time.monotonic() + 30
-        while daemon_running() and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return {"stopped": True, "pid": pid}
             time.sleep(0.1)
-        if daemon_running():
-            raise Failure("daemon_stop_failed", "felkodd is still running after 30 s")
-        return {"stopped": True}
+        raise Failure("daemon_stop_failed", f"felkodd (pid {pid}) is still running after 30 s")
     raise Failure("bad_request", f"unknown daemon action {args.action}")
 
 
@@ -178,6 +191,8 @@ def native_params(args):
 
 
 def cmd_read(args):
+    if args.duration is not None and args.duration <= 0:
+        raise Failure("bad_request", "--duration must be > 0 seconds; use log start for an open-ended log")
     if args.duration is None:
         return {"results": [data("job.run", {"job": job}) for job in args.jobs]}
     started = data("log.start", {"jobs": args.jobs, "slow_jobs": jobs_arg(args.slow_jobs),
@@ -220,7 +235,21 @@ def cmd_ds2(args):
 
 
 def cmd_sessions(args):
-    return data("sessions.list")
+    # read from disk, so listing never needs (or starts) the daemon
+    root = data_dir() / "sessions"
+    running = None
+    if daemon_running():
+        running = call("log.status", autostart=False).get("data", {}).get("session_id")
+    sessions = []
+    for meta_path in sorted(root.glob("*/meta.json"), reverse=True):
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        meta["dir"] = str(meta_path.parent)
+        meta["running"] = meta.get("id") == running
+        sessions.append(meta)
+    return {"sessions_dir": str(root), "sessions": sessions}
 
 
 def session_db(session_id):
@@ -236,8 +265,8 @@ def session_show(session_id):
     db = session_db(session_id)
     meta = {}
     for row in db.execute("SELECT key, value FROM meta"):
-        try:
-            meta[row["key"]] = json.loads(row["value"]) if row["value"] and row["value"][:1] in "[{" else row["value"]
+        try:  # non-string values are stored as JSON text
+            meta[row["key"]] = json.loads(row["value"]) if row["value"] is not None else None
         except json.JSONDecodeError:
             meta[row["key"]] = row["value"]
     span = db.execute("SELECT MIN(t) AS first, MAX(t) AS last, COUNT(*) AS samples FROM samples").fetchone()

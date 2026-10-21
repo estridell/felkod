@@ -124,8 +124,10 @@ sealed class Bus : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    // A bug in one step must not take down the daemon or lose the session.
+                    // A bug in one step must not take down the daemon or lose the session; it is
+                    // recorded in the session so the gap it leaves is visible.
                     Console.Error.WriteLine($"felkodd: logging step failed: {ex}");
+                    log.InternalError(ex);
                     worked = false;
                 }
                 if (!worked && queue.TryTake(out work, 100))
@@ -243,12 +245,24 @@ sealed class Bus : IDisposable
             return (RunJob(job, args), null);
         }
         var exchange = RawExchange(request, gapMs);
-        var sets = decoder.Decode(job, args, request, exchange.Response);
-        if (sets == null)
+        byte status = exchange.Response[2];
+        if (status == 0xA1)
         {
-            return (RunJob(job, args), null);
+            // The SGBD answers BUSY by sending the telegram again; report it rather than decode it.
+            throw new FelkodException("ecu_rejected", "JOB_STATUS=BUSY (DS2 status A1)");
         }
-        return (sets, exchange);
+        var sets = decoder.Decode(job, args, request, exchange.Response);
+        if (sets != null)
+        {
+            return (sets, exchange);
+        }
+        if (status != 0xA0)
+        {
+            throw new FelkodException("ecu_rejected", $"DS2 status {status:X2}; the SGBD could not decode the reply");
+        }
+        // An OK reply the job could not finish on: it really needs more than one telegram.
+        decoder.MarkNotNative(job, args);
+        return (RunJob(job, args), null);
     }
 
     // One telegram on the wire, native. IsLink failures close the port so the next call reopens it.
@@ -262,7 +276,16 @@ sealed class Bus : IDisposable
         try
         {
             native ??= new Ds2Port(config.Port);
-            var exchange = native.Transact(request, gapMs, Ds2FirstByteTimeoutMs, Ds2InterByteTimeoutMs);
+            Ds2Exchange exchange;
+            try
+            {
+                exchange = native.Transact(request, gapMs, Ds2FirstByteTimeoutMs, Ds2InterByteTimeoutMs);
+            }
+            catch (FelkodException ex) when (ex.Code == Ds2Port.Corrupt)
+            {
+                // one garbled reply is noise, not a lost link: try once more (input is flushed first)
+                exchange = native.Transact(request, gapMs, Ds2FirstByteTimeoutMs, Ds2InterByteTimeoutMs);
+            }
             Link.Ok();
             return exchange;
         }

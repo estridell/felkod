@@ -3,7 +3,7 @@ using System.IO.Ports;
 
 namespace Felkod.Daemon;
 
-// One request/response on the K-line, with timings measured from the end of sending.
+// Times in ms from the start of writing the request: echo complete, first reply byte (after the echo), reply complete.
 sealed record Ds2Exchange(byte[] Request, byte[] Response, double EchoMs, double FirstByteMs, double TotalMs, double WaitedMs);
 
 // Native DS2 over the K+DCAN cable: 9600 baud 8E1, telegram = address, total length, payload, XOR checksum.
@@ -15,6 +15,10 @@ sealed class Ds2Port : IDisposable
     const int EchoTimeoutMs = 200;
     // Per byte at 9600 baud with 11 bits per byte (start, 8 data, even parity, stop).
     const double ByteMs = 11 * 1000.0 / 9600;
+
+    // A reply arrived but was garbled (checksum, framing, echo): worth one immediate retry,
+    // unlike silence, which means the ECU or cable is gone.
+    public const string Corrupt = "link_corrupt";
 
     readonly SerialPort port;
     long lastResponseEnd;
@@ -69,9 +73,9 @@ sealed class Ds2Port : IDisposable
             var echo = ReadExactly(request.Length, EchoTimeoutMs + request.Length * ByteMs);
             if (echo == null || !echo.AsSpan().SequenceEqual(request))
             {
-                throw new FelkodException("link", echo == null
-                    ? "no echo from the cable (is the switch on K and the cable on the OBD port?)"
-                    : $"echo mismatch: sent {Convert.ToHexString(request)}, got {Convert.ToHexString(echo)}", isLink: true);
+                throw echo == null
+                    ? new FelkodException("link", "no echo from the cable (is the switch on K and the cable on the OBD port?)", isLink: true)
+                    : new FelkodException(Corrupt, $"echo mismatch: sent {Convert.ToHexString(request)}, got {Convert.ToHexString(echo)}", isLink: true);
             }
             double echoMs = clock.Elapsed.TotalMilliseconds;
 
@@ -84,27 +88,28 @@ sealed class Ds2Port : IDisposable
             int length = head[1];
             if (length < 4 || head[0] != request[0])
             {
-                throw new FelkodException("link", $"not a DS2 reply: {Convert.ToHexString(head)}", isLink: true);
+                throw new FelkodException(Corrupt, $"not a DS2 reply: {Convert.ToHexString(head)}", isLink: true);
             }
             var tail = ReadExactly(length - 2, (length - 2) * ByteMs + interByteTimeoutMs);
             if (tail == null)
             {
-                throw new FelkodException("link", $"reply cut short after {Convert.ToHexString(head)}", isLink: true);
+                throw new FelkodException(Corrupt, $"reply cut short after {Convert.ToHexString(head)}", isLink: true);
             }
             var response = new byte[length];
             head.CopyTo(response, 0);
             tail.CopyTo(response, 2);
             if (Checksum(response.AsSpan(0, length - 1)) != response[^1])
             {
-                throw new FelkodException("link", $"checksum error in reply {Convert.ToHexString(response)}", isLink: true);
+                throw new FelkodException(Corrupt, $"checksum error in reply {Convert.ToHexString(response)}", isLink: true);
             }
             lastResponseEnd = Stopwatch.GetTimestamp();
             return new Ds2Exchange(request, response, Math.Round(echoMs, 2), Math.Round(firstByteMs, 2),
                 Math.Round(clock.Elapsed.TotalMilliseconds, 2), Math.Round(waitedMs, 2));
         }
-        catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not FelkodException)
         {
-            throw new FelkodException("link", $"serial port: {ex.Message}", isLink: true);
+            // write timeouts, a yanked device, a closed port: all mean the link is gone
+            throw new FelkodException("link", $"serial port: {ex.GetType().Name}: {ex.Message}", isLink: true);
         }
     }
 
