@@ -1,0 +1,20 @@
+# BMW files from your own EDIABAS/INPA installation: proprietary, kept locally, never committed.
+# See vendor/README.md.
+vendor/bmw/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# .NET
+bin/
+obj/
+
+# felkod session data
+sessions/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
