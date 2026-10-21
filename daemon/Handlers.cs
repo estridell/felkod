@@ -141,8 +141,20 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         };
     }
 
+    // EDIABAS's built-in metadata jobs: they read the SGBD file itself and never talk to the ECU.
+    static readonly HashSet<string> VirtualJobs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "_JOBS", "_JOBCOMMENTS", "_ARGUMENTS", "_RESULTS", "_VERSIONINFO", "_TABLES", "_TABLE",
+    };
+
     async Task<JsonNode?> JobRun(string job, string args, bool allowWrite)
     {
+        if (VirtualJobs.Contains(job))
+        {
+            // offline, from the catalog: no bus, no ECU, works without the car
+            var metadata = catalog.Run(job.ToUpperInvariant(), args);
+            return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(metadata) };
+        }
         catalog.RequireJobs([job]);
         if (!allowWrite && !Results.IsReadOnlyJob(job))
         {
