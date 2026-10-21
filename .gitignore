@@ -18,3 +18,6 @@ sessions/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Spike traces (raw EDIABAS/IFH logs)
+spike/traces/
