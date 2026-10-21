@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""felkod: diagnostics for a BMW E46 (Siemens MS43) over a K+DCAN cable.
+
+Talks to felkodd (the daemon that owns the cable) over a unix socket and starts it when needed.
+Every command prints one JSON object: {"ok": true, "data": ..., "warnings": [...]} or
+{"ok": false, "error": {"code": ..., "message": ...}}. Exit status 0 = ok, 1 = error, 2 = usage.
+Stdlib only.
+"""
+
+import argparse
+import json
+import os
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+DAEMON = Path(os.environ.get("FELKOD_DAEMON", REPO / "daemon" / "bin" / "Release" / "net10.0" / "felkodd"))
+CALL_TIMEOUT_S = 90  # a job can wait for one logging step, then take up to the daemon's job timeout
+
+
+class Failure(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def socket_path():
+    if os.environ.get("FELKOD_SOCKET"):
+        return Path(os.environ["FELKOD_SOCKET"])
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime) / "felkod.sock"
+    return Path("/tmp") / f"felkod-{os.environ.get('USER', 'user')}.sock"
+
+
+def data_dir():
+    base = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+    return Path(base) / "felkod"
+
+
+def daemon_running():
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(str(socket_path()))
+        return True
+    except OSError:
+        return False
+
+
+def start_daemon(extra_args=()):
+    if daemon_running():
+        return False
+    if not DAEMON.exists():
+        raise Failure("daemon_missing", f"{DAEMON} not found; build it with: dotnet build -c Release {REPO / 'daemon'}")
+    data_dir().mkdir(parents=True, exist_ok=True)
+    log = open(data_dir() / "felkodd.log", "ab")
+    subprocess.Popen([str(DAEMON), "--socket", str(socket_path()), *extra_args], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     start_new_session=True)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if daemon_running():
+            return True
+        time.sleep(0.1)
+    raise Failure("daemon_start_failed", f"felkodd did not come up; see {data_dir() / 'felkodd.log'}")
+
+
+def call(method, params=None, autostart=True):
+    """Sends one request; returns the daemon's response object (ok/data/warnings or ok/error)."""
+    if autostart:
+        start_daemon()
+    request = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(CALL_TIMEOUT_S)
+            s.connect(str(socket_path()))
+            s.sendall(request.encode())
+            buffer = b""
+            while not buffer.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise Failure("daemon_gone", "felkodd closed the connection")
+                buffer += chunk
+    except socket.timeout:
+        raise Failure("daemon_timeout", f"no answer from felkodd within {CALL_TIMEOUT_S} s")
+    except (FileNotFoundError, ConnectionRefusedError):
+        raise Failure("daemon_not_running", "felkodd is not running; start it with: felkod daemon start")
+    response = json.loads(buffer)
+    response.pop("id", None)
+    return response
+
+
+def data(method, params=None):
+    """Calls the daemon and returns its data, raising Failure on an error response."""
+    response = call(method, params)
+    if not response["ok"]:
+        raise Failure(response["error"]["code"], response["error"]["message"])
+    WARNINGS.extend(response.get("warnings", []))
+    return response["data"]
+
+
+WARNINGS = []
+SESSION_TABLES = ("samples(id, t, elapsed_s, cycle, job, ms); readings(sample_id, name, value, text, unit); "
+                  "events(id, t, elapsed_s, kind, job, detail); meta(key, value); "
+                  "view series(t, elapsed_s, job, name, value, text, unit). t is UTC ISO 8601 at job start; "
+                  "names are the SGBD's result names; events.kind is link_lost, still_down, link_restored or job_error")
+
+
+def jobs_arg(text):
+    return [job.strip() for job in text.split(",") if job.strip()] if text else []
+
+
+# --- commands -------------------------------------------------------------------------------
+
+def cmd_status(args):
+    if not daemon_running():
+        return {"daemon": {"running": False, "socket": str(socket_path())},
+                "port": {"path": "/dev/felkod-kline", "present": os.path.exists("/dev/felkod-kline")}}
+    status = data("status")
+    status["daemon"]["running"] = True
+    return status
+
+
+def cmd_daemon(args):
+    if args.action == "start":
+        extra = []
+        for flag in ("port", "sgbd", "job_timeout"):
+            if getattr(args, flag):
+                extra += [f"--{flag.replace('_', '-')}", str(getattr(args, flag))]
+        started = start_daemon(extra)
+        return {"started": started, "already_running": not started, "socket": str(socket_path())}
+    if args.action == "stop":
+        if not daemon_running():
+            return {"stopped": False, "already_stopped": True}
+        data("daemon.stop")
+        deadline = time.monotonic() + 30
+        while daemon_running() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if daemon_running():
+            raise Failure("daemon_stop_failed", "felkodd is still running after 30 s")
+        return {"stopped": True}
+    raise Failure("bad_request", f"unknown daemon action {args.action}")
+
+
+def cmd_ident(args):
+    return data("ident")
+
+
+def cmd_faults(args):
+    if args.action == "clear":
+        return data("faults.clear", {"confirm": args.confirm})
+    return data("faults.read")
+
+
+def cmd_jobs(args):
+    if args.job:
+        return data("jobs.describe", {"job": args.job})
+    return data("jobs.list")
+
+
+def cmd_run(args):
+    return data("job.run", {"job": args.job, "args": args.args or "", "allow_write": args.allow_write})
+
+
+def cmd_read(args):
+    if args.duration is None:
+        return {"results": [data("job.run", {"job": job}) for job in args.jobs]}
+    started = data("log.start", {"jobs": args.jobs, "slow_jobs": jobs_arg(args.slow_jobs),
+                                 "slow_every": args.slow_every, "duration_s": args.duration, "note": args.note})
+    session_id = started["session_id"]
+    time.sleep(args.duration)
+    while (status := data("log.status")).get("session_id") == session_id:
+        time.sleep(0.2)
+    return session_show(session_id)
+
+
+def cmd_log(args):
+    if args.action == "start":
+        if not args.jobs:
+            raise Failure("bad_request", "log start needs --jobs")
+        return data("log.start", {"jobs": jobs_arg(args.jobs), "slow_jobs": jobs_arg(args.slow_jobs),
+                                  "slow_every": args.slow_every, "duration_s": args.duration or 0, "note": args.note})
+    if args.action == "stop":
+        return data("log.stop")
+    return data("log.status")
+
+
+def cmd_sessions(args):
+    return data("sessions.list")
+
+
+def session_db(session_id):
+    path = data_dir() / "sessions" / session_id / "session.sqlite"
+    if not path.exists():
+        raise Failure("unknown_session", f"no session {session_id} in {path.parent.parent}")
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def session_show(session_id):
+    db = session_db(session_id)
+    meta = {}
+    for row in db.execute("SELECT key, value FROM meta"):
+        try:
+            meta[row["key"]] = json.loads(row["value"]) if row["value"] and row["value"][:1] in "[{" else row["value"]
+        except json.JSONDecodeError:
+            meta[row["key"]] = row["value"]
+    span = db.execute("SELECT MIN(t) AS first, MAX(t) AS last, COUNT(*) AS samples FROM samples").fetchone()
+    jobs = {row["job"]: {"samples": row["n"], "mean_ms": round(row["ms"], 1)} for row in db.execute(
+        "SELECT job, COUNT(*) AS n, AVG(ms) AS ms FROM samples GROUP BY job")}
+    names = [dict(row) for row in db.execute(
+        "SELECT s.job, r.name, r.unit, COUNT(*) AS n, MIN(r.value) AS min, MAX(r.value) AS max "
+        "FROM readings r JOIN samples s ON s.id = r.sample_id GROUP BY s.job, r.name ORDER BY s.job, r.name")]
+    events = [dict(row) for row in db.execute("SELECT t, elapsed_s, kind, job, detail FROM events ORDER BY id")]
+    return {"session_id": session_id, "meta": meta, "first_sample": span["first"], "last_sample": span["last"],
+            "samples": span["samples"], "jobs": jobs, "readings": names, "events": events,
+            "tables": SESSION_TABLES}
+
+
+def cmd_session(args):
+    if args.action == "show":
+        return session_show(args.id)
+    db = session_db(args.id)
+    cursor = db.execute(args.sql)
+    columns = [d[0] for d in cursor.description or []]
+    rows = cursor.fetchmany(args.limit + 1)
+    if len(rows) > args.limit:
+        WARNINGS.append(f"truncated to {args.limit} rows; raise --limit or aggregate in SQL")
+        rows = rows[:args.limit]
+    return {"columns": columns, "rows": [list(row) for row in rows], "row_count": len(rows)}
+
+
+# --- parser ---------------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="felkod", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="daemon, cable and link state; does not start the daemon").set_defaults(func=cmd_status)
+
+    p = sub.add_parser("daemon", help="start or stop felkodd")
+    p.add_argument("action", choices=["start", "stop"])
+    p.add_argument("--port", help="serial device (default /dev/felkod-kline)")
+    p.add_argument("--sgbd", help="SGBD to use (default ms430ds0)")
+    p.add_argument("--job-timeout", type=float, help="seconds before a job counts as failed (default 15)")
+    p.set_defaults(func=cmd_daemon)
+
+    sub.add_parser("ident", help="DME identification (IDENT job)").set_defaults(func=cmd_ident)
+
+    p = sub.add_parser("faults", help="read stored faults (FS_LESEN), or clear them (FS_LOESCHEN)")
+    p.add_argument("action", nargs="?", choices=["read", "clear"], default="read")
+    p.add_argument("--confirm", action="store_true",
+                   help="required for clear; the faults are saved to the audit log before clearing")
+    p.set_defaults(func=cmd_faults)
+
+    p = sub.add_parser("jobs", help="list the SGBD's jobs, or describe one (arguments, results, comments)")
+    p.add_argument("job", nargs="?")
+    p.set_defaults(func=cmd_jobs)
+
+    p = sub.add_parser("run", help="run one SGBD job; jobs that change the car need --allow-write")
+    p.add_argument("job")
+    p.add_argument("args", nargs="?", help="EDIABAS argument string, e.g. 'arg1;arg2'")
+    p.add_argument("--allow-write", action="store_true")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("read", help="run read-only jobs once, or log them for --duration seconds")
+    p.add_argument("jobs", nargs="+")
+    p.add_argument("--duration", type=float)
+    p.add_argument("--slow-jobs", help="comma list, run every --slow-every cycles")
+    p.add_argument("--slow-every", type=int, default=10)
+    p.add_argument("--note")
+    p.set_defaults(func=cmd_read)
+
+    p = sub.add_parser("log", help="background logging session: start, stop, status")
+    p.add_argument("action", choices=["start", "stop", "status"])
+    p.add_argument("--jobs", help="comma list of read-only jobs, run every cycle")
+    p.add_argument("--slow-jobs", help="comma list, run every --slow-every cycles")
+    p.add_argument("--slow-every", type=int, default=10)
+    p.add_argument("--duration", type=float, help="seconds; default runs until log stop")
+    p.add_argument("--note")
+    p.set_defaults(func=cmd_log)
+
+    sub.add_parser("sessions", help="list logging sessions").set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser("session", help="inspect a session: show (summary) or query (read-only SQL)",
+                       description="Session database (SQLite, read-only here): " + SESSION_TABLES)
+    p.add_argument("action", choices=["show", "query"])
+    p.add_argument("id")
+    p.add_argument("sql", nargs="?")
+    p.add_argument("--limit", type=int, default=1000)
+    p.set_defaults(func=cmd_session)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    if getattr(args, "action", None) == "query" and not args.sql:
+        build_parser().error("session query needs SQL")
+    try:
+        output = {"ok": True, "data": args.func(args), "warnings": WARNINGS}
+        code = 0
+    except Failure as failure:
+        output = {"ok": False, "error": {"code": failure.code, "message": failure.message}, "warnings": WARNINGS}
+        code = 1
+    except sqlite3.Error as error:
+        output = {"ok": False, "error": {"code": "sql", "message": str(error)}, "warnings": WARNINGS}
+        code = 1
+    print(json.dumps(output, indent=2 if sys.stdout.isatty() else None, ensure_ascii=False))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
