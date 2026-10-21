@@ -11,9 +11,16 @@ spike jobs                          # offline: list MS430DS0.prg jobs
 spike results STATUS_MESSWERTEBLOCK # offline: a job's results
 spike run IDENT                     # needs the car
 spike bench STATUS_MESSWERTEBLOCK 20
+spike log                           # loop until Ctrl+C, one JSON line per job in traces/<ts>/log.jsonl
 ```
 
 Options: `--port` (default `/dev/felkod-kline`), `--sgbd` (default `ms430ds0`), `--ecu-path`, `--trace-dir`.
+
+Log options: `--jobs` (comma list, default `STATUS_MESSWERTEBLOCK`), `--slow-jobs` (run every
+`--slow-every` cycles, default 10), `--duration` (seconds, 0 = until Ctrl+C).
+The log survives stalls, ignition cycles and cable replugs: a failed job writes a `link_lost` event,
+a fresh connection is probed every second (`still_down` every 10 s), and logging resumes with a
+`link_restored` event as soon as the DME answers.
 
 ## One-time setup (done 2026-10-21)
 
