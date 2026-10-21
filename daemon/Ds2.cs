@@ -45,6 +45,11 @@ sealed class Ds2Port : IDisposable
         }
     }
 
+    // An SGBD hands over a DS2 telegram without its checksum (the transport adds it) unless the job
+    // computes it itself; this gives the full telegram as it goes on the wire either way.
+    public static byte[] FullTelegram(byte[] sendData) =>
+        sendData.Length >= 2 && sendData.Length == sendData[1] - 1 ? [.. sendData, Checksum(sendData)] : sendData;
+
     public static byte Checksum(ReadOnlySpan<byte> data)
     {
         byte x = 0;
@@ -139,6 +144,10 @@ sealed class Ds2Port : IDisposable
             catch (TimeoutException)
             {
                 // nothing arrived within the read timeout
+            }
+            catch (Exception ex)
+            {
+                throw new FelkodException("link", $"serial port: {ex.GetType().Name}: {ex.Message}", isLink: true);
             }
         }
         lastResponseEnd = Stopwatch.GetTimestamp();
