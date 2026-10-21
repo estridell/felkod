@@ -14,7 +14,10 @@ spike bench STATUS_MESSWERTEBLOCK 20
 spike log                           # loop until Ctrl+C, one JSON line per job in traces/<ts>/log.jsonl
 ```
 
-Options: `--port` (default `/dev/felkod-kline`), `--sgbd` (default `ms430ds0`), `--ecu-path`, `--trace-dir`.
+Options: `--port` (default `/dev/felkod-kline`), `--sgbd` (default `ms430ds0`), `--ecu-path`, `--trace-dir`,
+`--job-timeout` (seconds, default 15), `--allow-write yes` (needed for any job that is not read-only:
+`STEUERN_*`, `*_LOESCHEN`, `*_PROGRAMMIEREN`, ...). A job whose `JOB_STATUS` is not `OKAY` (the ECU
+rejected it) counts as failed and its values are never reported.
 
 Log options: `--jobs` (comma list, default `STATUS_MESSWERTEBLOCK`), `--slow-jobs` (run every
 `--slow-every` cycles, default 10), `--duration` (seconds, 0 = until Ctrl+C).

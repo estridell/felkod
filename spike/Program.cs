@@ -17,6 +17,8 @@ var opts = new Dictionary<string, string>
     ["slow-jobs"] = "",
     ["slow-every"] = "10",
     ["duration"] = "0",
+    ["job-timeout"] = "15",
+    ["allow-write"] = "no",
 };
 var rest = new List<string>();
 for (int i = 0; i < args.Length; i++)
@@ -40,7 +42,7 @@ for (int i = 0; i < args.Length; i++)
 if (rest.Count == 0)
 {
     Console.Error.WriteLine("""
-        usage: felkod-spike [--port DEV] [--ecu-path DIR] [--sgbd NAME] [--trace-dir DIR] <command>
+        usage: felkod-spike [options] <command>
           jobs                     list the SGBD's jobs and comments (offline)
           results <job>            list a job's results (offline)
           args <job>               list a job's arguments (offline)
@@ -48,8 +50,10 @@ if (rest.Count == 0)
           bench <job> [n]          run a job n times (default 20), report jobs/s
           log                      run --jobs in a loop until stopped or --duration seconds,
                                    --slow-jobs every --slow-every cycles; one JSON line per job
-                                   to <trace-dir>/log.jsonl, flushed immediately; keeps retrying
-                                   through stalls, ignition cycles and cable replugs
+                                   appended to <trace-dir>/log.jsonl, flushed immediately; keeps
+                                   retrying through stalls, ignition cycles and cable replugs
+        options: --port DEV --ecu-path DIR --sgbd NAME --trace-dir DIR --job-timeout SEC (15)
+                 --allow-write yes   permit jobs that change the car (STEUERN_*, *_LOESCHEN, ...)
         Stop with Ctrl+C, or SIGTERM/SIGHUP when running in the background (background shells
         ignore SIGINT). A second signal exits immediately.
         """);
@@ -62,25 +66,39 @@ if (traceDir.Length == 0)
     traceDir = Path.Combine(Directory.GetCurrentDirectory(), "traces", DateTime.Now.ToString("yyyyMMdd-HHmmss"));
 }
 Directory.CreateDirectory(traceDir);
+double jobTimeoutS = double.Parse(opts["job-timeout"], CultureInfo.InvariantCulture);
+bool allowWrite = opts["allow-write"] == "yes";
 
 // EdiabasLib reads SGBD text as Windows-1252, which .NET only ships as an opt-in provider.
 System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
 
-// First signal asks loops to finish cleanly (summary printed, traces flushed); a second one exits.
-bool stop = false;
+// First signal asks loops to finish cleanly (current job aborted, summary printed, traces flushed);
+// a second one exits. The registrations must stay referenced, or the GC unregisters them.
+var stopSource = new CancellationTokenSource();
+bool Stopping() => stopSource.IsCancellationRequested;
 var signalHandlers = new[] { PosixSignal.SIGINT, PosixSignal.SIGTERM, PosixSignal.SIGHUP }
     .Select(signal => PosixSignalRegistration.Create(signal, context =>
     {
         context.Cancel = true;
-        if (stop)
+        if (Stopping())
         {
             Environment.Exit(130);
         }
-        stop = true;
-        Console.Error.WriteLine($"{context.Signal}: stopping after the current job");
+        stopSource.Cancel();
+        try
+        {
+            Console.Error.WriteLine($"{context.Signal}: stopping");
+        }
+        catch (Exception)
+        {
+            // stderr may be gone (SIGHUP from a closed terminal)
+        }
     }))
     .ToList();
 
+// Times the running job; EdiabasLib polls AbortJobFunc, which ends jobs past the deadline
+// (e.g. an ECU answering BUSY forever) and jobs interrupted by a stop signal.
+var jobClock = new Stopwatch();
 EdiabasNet ediabas = CreateEdiabas();
 
 var output = new JsonObject
@@ -106,9 +124,15 @@ try
             output["result_sets"] = RunJob("_ARGUMENTS", Arg(1));
             break;
         case "run":
-            output["result_sets"] = RunJob(Arg(1), rest.Count > 2 ? rest[2] : "");
+        {
+            CheckWriteAllowed(Arg(1));
+            var sets = RunJob(Arg(1), rest.Count > 2 ? rest[2] : "");
+            output["result_sets"] = sets;
+            EnsureOkay(sets);
             break;
+        }
         case "bench":
+            CheckWriteAllowed(Arg(1));
             output["bench"] = RunBench(Arg(1), rest.Count > 2 ? int.Parse(rest[2], CultureInfo.InvariantCulture) : 20);
             if (output["bench"]!["ok"]!.GetValue<int>() == 0)
             {
@@ -129,7 +153,7 @@ catch (Exception ex)
     output["error"] = new JsonObject
     {
         ["type"] = ex.GetType().Name,
-        ["message"] = ex.Message,
+        ["message"] = ErrorText(ex),
         ["ediabas_error"] = ediabas.ErrorCodeLast.ToString(),
     };
 }
@@ -147,6 +171,7 @@ finally
 }
 
 Console.WriteLine(output.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+GC.KeepAlive(signalHandlers);
 // Exit explicitly: a comm thread stuck in serial I/O must not keep the process alive.
 Environment.Exit(output["ok"]!.GetValue<bool>() ? 0 : 1);
 return 0;
@@ -162,21 +187,60 @@ EdiabasNet CreateEdiabas()
     instance.SetConfigProperty("TracePath", traceDir);
     instance.SetConfigProperty("AppendTrace", "1");
     instance.SetConfigProperty("ApiTrace", "1");
-    instance.SetConfigProperty("IfhTrace", "3");
-    // Unbuffered, so the raw telegrams survive a kill; they are the replay fixtures.
+    // Level 1 keeps the raw telegrams (the replay fixtures) without the interpreter's op-level
+    // trace, which runs at ~14 MB/s.
+    instance.SetConfigProperty("IfhTrace", "1");
+    // Unbuffered, so the telegrams survive a kill.
     instance.SetConfigProperty("IfhTraceBuffering", "0");
     instance.SetConfigProperty("TraceBuffering", "0");
     // Metadata jobs (_JOBS, _RESULTS, ...) read the .prg only; skip the init job so they work without a car.
     instance.NoInitForVJobs = true;
+    instance.AbortJobFunc = () => Stopping() || (jobClock.IsRunning && jobClock.Elapsed.TotalSeconds > jobTimeoutS);
     instance.ResolveSgbdFile(opts["sgbd"]);
     return instance;
 }
 
-// A communication failure (IFH_*) means the ECU or cable went away; anything else is a job problem.
-bool IsLinkError() => ediabas.ErrorCodeLast.ToString().StartsWith("EDIABAS_IFH_");
+// Jobs that only read. Anything else (STEUERN_*, *_LOESCHEN, *_PROGRAMMIEREN, ...) changes the car
+// and needs --allow-write yes.
+bool IsReadOnlyJob(string job)
+{
+    string name = job.ToUpperInvariant();
+    return name.StartsWith('_') || name.StartsWith("STATUS_") || name.StartsWith("LESEN_") || name.EndsWith("_LESEN")
+        || name is "IDENT" or "IDENT_AIF" or "INFO" or "ECU_CONFIG";
+}
 
-string ErrorText(Exception ex) =>
-    ediabas.ErrorCodeLast.ToString() is var code && code != "EDIABAS_ERR_NONE" ? code : ex.Message;
+void CheckWriteAllowed(string job)
+{
+    if (!allowWrite && !IsReadOnlyJob(job))
+    {
+        throw new InvalidOperationException($"{job} is not a read-only job; pass --allow-write yes to run it");
+    }
+}
+
+// A communication failure (IFH_*) or a job past its deadline means the ECU or cable went away;
+// anything else (rejected request, unknown job) is a job problem.
+bool IsLinkError(Exception ex) =>
+    ex is TimeoutException || ediabas.ErrorCodeLast.ToString().StartsWith("EDIABAS_IFH_");
+
+string ErrorText(Exception ex) => ex switch
+{
+    JobStatusException or TimeoutException => ex.Message,
+    _ when ediabas.ErrorCodeLast.ToString() is var code && code != "EDIABAS_ERR_NONE" => code,
+    _ => ex.Message,
+};
+
+// The SGBD reports ECU rejections (negative responses) through JOB_STATUS, with the value
+// results left as zeros or garbage; such results must never be treated as data.
+void EnsureOkay(JsonArray sets)
+{
+    foreach (var set in sets)
+    {
+        if (set!["JOB_STATUS"] is JsonNode status && status.GetValue<string>() != "OKAY")
+        {
+            throw new JobStatusException(status.GetValue<string>());
+        }
+    }
+}
 
 // The first run includes connecting and the SGBD init job, so it is reported separately.
 JsonObject RunBench(string job, int n)
@@ -188,12 +252,14 @@ JsonObject RunBench(string job, int n)
     var times = new List<double>();
     var errors = new JsonArray();
     double? firstRun = null;
-    for (int i = 0; i < n && !stop; i++)
+    int attempted = 0;
+    for (int i = 0; i < n && !Stopping(); i++)
     {
+        attempted++;
         var sw = Stopwatch.StartNew();
         try
         {
-            RunJob(job, "");
+            EnsureOkay(RunJob(job, ""));
             if (firstRun == null)
             {
                 firstRun = sw.Elapsed.TotalMilliseconds;
@@ -210,12 +276,12 @@ JsonObject RunBench(string job, int n)
     }
     var result = new JsonObject
     {
-        ["runs"] = n,
+        ["runs"] = attempted,
         ["ok"] = times.Count + (firstRun == null ? 0 : 1),
         ["failed"] = errors.Count,
         ["first_run_ms"] = firstRun == null ? null : Math.Round(firstRun.Value, 1),
         ["errors"] = errors,
-        ["note"] = "stats exclude the first successful run; tracing is on, so rates are a lower bound",
+        ["note"] = "stats exclude the first successful run",
     };
     if (times.Count > 0)
     {
@@ -232,10 +298,11 @@ JsonObject RunBench(string job, int n)
 }
 
 // Logs until stopped or --duration, surviving stalls, ignition cycles and cable replugs.
-// While the link is up: one line per job. A communication failure writes one link_lost event,
-// then a fresh EdiabasLib instance (new port handle, init job rerun) is probed once a second,
-// with a still_down event every 10 s, until a job succeeds again (link_restored).
-// Other job failures write a job_error line and logging continues.
+// While the link is up: one line per successful job (`t` = when the job started). A communication
+// failure writes one link_lost event (stamped with the failing job's start), then a fresh
+// EdiabasLib instance (new port handle, init job rerun) is probed about once a second, with a
+// still_down event every 10 s, until a job succeeds again (link_restored).
+// Other job failures (e.g. the ECU rejecting a request) write a job_error line and logging continues.
 JsonObject RunLog()
 {
     string[] SplitJobs(string list) => list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -248,10 +315,20 @@ JsonObject RunLog()
     {
         throw new ArgumentException("--jobs is empty");
     }
+    var known = RunJob("_JOBS", "").Skip(1).Select(set => set!["JOBNAME"]?.GetValue<string>()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var unknown = jobs.Concat(slowJobs).Where(job => !known.Contains(job)).ToList();
+    if (unknown.Count > 0)
+    {
+        throw new ArgumentException($"not in {ediabas.SgbdFileName}: {string.Join(", ", unknown)}");
+    }
+    foreach (string job in jobs.Concat(slowJobs))
+    {
+        CheckWriteAllowed(job);
+    }
 
     Console.Error.WriteLine($"logging to {logPath}; stop with Ctrl+C or SIGTERM");
 
-    using var writer = new StreamWriter(logPath) { AutoFlush = true };
+    using var writer = new StreamWriter(logPath, append: true) { AutoFlush = true };
     var clock = Stopwatch.StartNew();
     var counts = new Dictionary<string, int>();
     var jobErrors = new Dictionary<string, int>();
@@ -260,13 +337,15 @@ JsonObject RunLog()
     bool linkUp = true;
     double downSince = 0;
     double lastStillDown = 0;
+    string lastProbeError = "";
 
-    bool Running() => !stop && (duration <= 0 || clock.Elapsed.TotalSeconds < duration);
+    bool Running() => !Stopping() && (duration <= 0 || clock.Elapsed.TotalSeconds < duration);
+    double Elapsed() => Math.Round(clock.Elapsed.TotalSeconds, 3);
     string Now() => clock.Elapsed.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture);
-    JsonObject Stamp(JsonObject line)
+    JsonObject Stamp(JsonObject line, DateTime? at = null, double? elapsed = null)
     {
-        line["t"] = DateTime.UtcNow.ToString("o");
-        line["elapsed_s"] = Math.Round(clock.Elapsed.TotalSeconds, 3);
+        line["t"] = (at ?? DateTime.UtcNow).ToString("o");
+        line["elapsed_s"] = elapsed ?? Elapsed();
         return line;
     }
     void Write(JsonObject line) => writer.WriteLine(line.ToJsonString());
@@ -274,16 +353,20 @@ JsonObject RunLog()
     // Runs one job and writes its line; throws if the job failed (nothing written).
     void Sample(string job)
     {
-        var line = Stamp(new JsonObject { ["cycle"] = cycle, ["job"] = job });
+        var startedAt = DateTime.UtcNow;
+        double startedElapsed = Elapsed();
         var sw = Stopwatch.StartNew();
+        var sets = RunJob(job, "");
+        EnsureOkay(sets);
         var values = new JsonObject();
-        foreach (var set in RunJob(job, "").Skip(1))
+        foreach (var set in sets.Skip(1))
         {
             foreach (var (name, value) in set!.AsObject())
             {
                 values[name] = value?.DeepClone();
             }
         }
+        var line = Stamp(new JsonObject { ["cycle"] = cycle, ["job"] = job }, startedAt, startedElapsed);
         line["ms"] = Math.Round(sw.Elapsed.TotalMilliseconds, 1);
         line["values"] = values;
         Write(line);
@@ -301,29 +384,39 @@ JsonObject RunLog()
                 {
                     break;
                 }
+                var startedAt = DateTime.UtcNow;
+                double startedElapsed = Elapsed();
                 try
                 {
                     Sample(job);
                 }
-                catch (Exception ex) when (IsLinkError())
+                catch (Exception) when (Stopping())
+                {
+                    break;
+                }
+                catch (Exception ex) when (IsLinkError(ex))
                 {
                     linkUp = false;
-                    downSince = lastStillDown = clock.Elapsed.TotalSeconds;
-                    Write(Stamp(new JsonObject { ["event"] = "link_lost", ["job"] = job, ["error"] = ErrorText(ex) }));
+                    downSince = lastStillDown = startedElapsed;
+                    lastProbeError = ErrorText(ex);
+                    var line = Stamp(new JsonObject { ["event"] = "link_lost", ["job"] = job, ["error"] = ErrorText(ex) }, startedAt, startedElapsed);
+                    line["detected_elapsed_s"] = Elapsed();
+                    Write(line);
                     Console.Error.WriteLine($"[{Now()}s] link lost: {ErrorText(ex)}; retrying");
                     break;
                 }
                 catch (Exception ex)
                 {
-                    Write(Stamp(new JsonObject { ["event"] = "job_error", ["cycle"] = cycle, ["job"] = job, ["error"] = ErrorText(ex) }));
+                    Write(Stamp(new JsonObject { ["event"] = "job_error", ["cycle"] = cycle, ["job"] = job, ["error"] = ErrorText(ex) }, startedAt, startedElapsed));
                     jobErrors[job] = jobErrors.GetValueOrDefault(job) + 1;
+                    Thread.Sleep(200);
                 }
             }
             cycle++;
             continue;
         }
 
-        Thread.Sleep(1000);
+        stopSource.Token.WaitHandle.WaitOne(1000);
         if (!Running())
         {
             break;
@@ -331,7 +424,7 @@ JsonObject RunLog()
         if (clock.Elapsed.TotalSeconds - lastStillDown >= 10)
         {
             lastStillDown = clock.Elapsed.TotalSeconds;
-            Write(Stamp(new JsonObject { ["event"] = "still_down", ["down_s"] = Math.Round(lastStillDown - downSince, 1) }));
+            Write(Stamp(new JsonObject { ["event"] = "still_down", ["down_s"] = Math.Round(lastStillDown - downSince, 1), ["last_error"] = lastProbeError }));
         }
         try
         {
@@ -339,8 +432,9 @@ JsonObject RunLog()
             ediabas = CreateEdiabas();
             Sample(jobs[0]);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            lastProbeError = ErrorText(ex);
             continue;
         }
         double downFor = Math.Round(clock.Elapsed.TotalSeconds - downSince, 1);
@@ -348,6 +442,16 @@ JsonObject RunLog()
         outages.Add(new JsonObject { ["at_s"] = Math.Round(downSince, 1), ["down_s"] = downFor });
         Write(Stamp(new JsonObject { ["event"] = "link_restored", ["down_s"] = downFor }));
         Console.Error.WriteLine($"[{Now()}s] link restored after {downFor}s");
+    }
+    if (!linkUp)
+    {
+        outages.Add(new JsonObject
+        {
+            ["at_s"] = Math.Round(downSince, 1),
+            ["down_s"] = Math.Round(clock.Elapsed.TotalSeconds - downSince, 1),
+            ["open"] = true,
+            ["last_error"] = lastProbeError,
+        });
     }
 
     var perJob = new JsonObject();
@@ -377,7 +481,23 @@ JsonArray RunJob(string job, string argString)
     ediabas.ArgString = argString;
     ediabas.ArgBinaryStd = null;
     ediabas.ResultsRequests = "";
-    ediabas.ExecuteJob(job);
+    jobClock.Restart();
+    try
+    {
+        ediabas.ExecuteJob(job);
+    }
+    catch (Exception) when (!Stopping() && jobClock.Elapsed.TotalSeconds > jobTimeoutS)
+    {
+        throw new TimeoutException($"{job}: no result within {jobTimeoutS} s");
+    }
+    finally
+    {
+        jobClock.Stop();
+    }
+    if (!Stopping() && jobClock.Elapsed.TotalSeconds > jobTimeoutS)
+    {
+        throw new TimeoutException($"{job}: no result within {jobTimeoutS} s");
+    }
 
     var sets = new JsonArray();
     foreach (var set in ediabas.ResultSets)
@@ -400,4 +520,9 @@ JsonArray RunJob(string job, string argString)
         sets.Add(obj);
     }
     return sets;
+}
+
+class JobStatusException(string status) : Exception($"JOB_STATUS={status}")
+{
+    public string Status { get; } = status;
 }
