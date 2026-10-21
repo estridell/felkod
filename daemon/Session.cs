@@ -19,6 +19,10 @@ sealed class Session : IDisposable
         CREATE TABLE readings (sample_id INTEGER NOT NULL REFERENCES samples (id), name TEXT NOT NULL,
                                value REAL, text TEXT, unit TEXT);
         CREATE INDEX readings_by_name ON readings (name, sample_id);
+        -- the telegram exchange behind a natively transported sample (hex, with checksums; times in ms
+        -- from the end of sending the request: echo back, first reply byte, last reply byte)
+        CREATE TABLE raw (sample_id INTEGER PRIMARY KEY REFERENCES samples (id), request TEXT NOT NULL,
+                          response TEXT NOT NULL, echo_ms REAL, first_byte_ms REAL, total_ms REAL, waited_ms REAL);
         -- link_lost, still_down, link_restored, job_error, note
         CREATE TABLE events (id INTEGER PRIMARY KEY, t TEXT NOT NULL, elapsed_s REAL NOT NULL,
                              kind TEXT NOT NULL, job TEXT, detail TEXT);
@@ -87,7 +91,7 @@ sealed class Session : IDisposable
         File.WriteAllText(metaPath, meta.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
     }
 
-    public void AddSample(DateTime t, double elapsed, int cycle, string job, double ms, JsonArray sets)
+    public void AddSample(DateTime t, double elapsed, int cycle, string job, double ms, JsonArray sets, Ds2Exchange? exchange = null)
     {
         using var tx = db.BeginTransaction();
         using var sample = db.CreateCommand();
@@ -123,6 +127,20 @@ sealed class Session : IDisposable
                 pUnit.Value = (object?)Results.UnitOf(obj, name) ?? DBNull.Value;
                 reading.ExecuteNonQuery();
             }
+        }
+        if (exchange != null)
+        {
+            using var raw = db.CreateCommand();
+            raw.CommandText = "INSERT INTO raw (sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms) "
+                + "VALUES ($id, $rq, $rs, $e, $f, $t, $w)";
+            raw.Parameters.AddWithValue("$id", id);
+            raw.Parameters.AddWithValue("$rq", Convert.ToHexString(exchange.Request));
+            raw.Parameters.AddWithValue("$rs", Convert.ToHexString(exchange.Response));
+            raw.Parameters.AddWithValue("$e", exchange.EchoMs);
+            raw.Parameters.AddWithValue("$f", exchange.FirstByteMs);
+            raw.Parameters.AddWithValue("$t", exchange.TotalMs);
+            raw.Parameters.AddWithValue("$w", exchange.WaitedMs);
+            raw.ExecuteNonQuery();
         }
         tx.Commit();
     }

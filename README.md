@@ -13,6 +13,7 @@ Status: v0.1 in progress. Phase 0 (EdiabasLib on Linux talking to the car) passe
 - `daemon/` — `felkodd` (C#, .NET 10): owns the K-line, runs SGBD jobs via EdiabasLib, logging sessions into SQLite
 - `cli/felkod` — the CLI (Python, stdlib only): talks to felkodd over a unix socket, starts it when needed
 - `skill/` — `SKILL.md` for agents, generated from the CLI's `--help` by `skill/generate.py`
+- `devtools/` — fake DS2 ECU replaying the recorded car session, and `smoke.sh` (end-to-end checks)
 - `spike/` — Phase 0 test program
 - `vendor/ediabaslib/` — EdiabasLib (git submodule, GPLv3)
 - `vendor/bmw/` — SGBDs, INPA scripts and NCS data from the cable kit (not committed; see `vendor/README.md`)
@@ -39,6 +40,11 @@ felkod log stop
 felkod sessions
 felkod session query <id> "SELECT t, name, value, unit FROM series WHERE name LIKE 'STAT_MOTORDREHZAHL%'"
 ```
+
+`--native` (log, read, bench) sends single-telegram jobs with felkodd's own DS2 transport and a
+configurable gap (`--gap-ms`, default BMW's 100 ms), then decodes the reply through the SGBD, so values are
+identical to EdiabasLib's while the rate is set by the wire, not EdiabasLib's fixed 100 ms regeneration time.
+Raw telegrams are kept in the session's `raw` table and can be re-decoded with `felkod ds2 decode`.
 
 Sessions live in `~/.local/share/felkod/sessions/<id>/` (`session.sqlite`, `meta.json`, raw telegram trace `ifh.trc`).
 Jobs that change the car need `--allow-write`; `faults clear` needs `--confirm` and saves the faults to
