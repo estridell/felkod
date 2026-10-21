@@ -189,6 +189,7 @@ sealed class SgbdDecoder
 
     bool Execute(string job, string args)
     {
+        Sgbd.Activate(ediabas);
         ediabas.ArgString = args;
         ediabas.ArgBinaryStd = null;
         ediabas.ResultsRequests = "";

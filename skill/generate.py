@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Writes skill/SKILL.md from the felkod CLI's own --help output, so the skill is a plain reference."""
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,8 @@ COMMANDS = ["status", "daemon", "ident", "faults", "jobs", "run", "read", "log",
 
 
 def help_text(*args):
-    return subprocess.run([sys.executable, str(CLI), *args, "--help"], capture_output=True, text=True, check=True).stdout
+    return subprocess.run([sys.executable, str(CLI), *args, "--help"], capture_output=True, text=True, check=True,
+                          env={**os.environ, "COLUMNS": "80"}).stdout
 
 
 def main():

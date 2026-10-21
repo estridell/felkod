@@ -66,7 +66,12 @@ if (traceDir.Length == 0)
     traceDir = Path.Combine(Directory.GetCurrentDirectory(), "traces", DateTime.Now.ToString("yyyyMMdd-HHmmss"));
 }
 Directory.CreateDirectory(traceDir);
-double jobTimeoutS = double.Parse(opts["job-timeout"], CultureInfo.InvariantCulture);
+if (!double.TryParse(opts["job-timeout"], CultureInfo.InvariantCulture, out double jobTimeoutS)
+    || !double.IsFinite(jobTimeoutS) || jobTimeoutS <= 0)
+{
+    Console.Error.WriteLine("--job-timeout must be a finite number > 0");
+    return 2;
+}
 bool allowWrite = opts["allow-write"] == "yes";
 
 // EdiabasLib reads SGBD text as Windows-1252, which .NET only ships as an opt-in provider.
@@ -99,7 +104,16 @@ var signalHandlers = new[] { PosixSignal.SIGINT, PosixSignal.SIGTERM, PosixSigna
 // Times the running job; EdiabasLib polls AbortJobFunc, which ends jobs past the deadline
 // (e.g. an ECU answering BUSY forever) and jobs interrupted by a stop signal.
 var jobClock = new Stopwatch();
-EdiabasNet ediabas = CreateEdiabas();
+EdiabasNet ediabas;
+try
+{
+    ediabas = CreateEdiabas();
+}
+catch (Exception ex)
+{
+    Console.WriteLine(JsonSerializer.Serialize(new { ok = false, error = new { type = ex.GetType().Name, message = ex.Message } }));
+    return 1;
+}
 
 var output = new JsonObject
 {
@@ -127,8 +141,8 @@ try
         {
             CheckWriteAllowed(Arg(1));
             var sets = RunJob(Arg(1), rest.Count > 2 ? rest[2] : "");
-            output["result_sets"] = sets;
             EnsureOkay(sets);
+            output["result_sets"] = sets;
             break;
         }
         case "bench":
@@ -205,7 +219,8 @@ EdiabasNet CreateEdiabas()
 bool IsReadOnlyJob(string job)
 {
     string name = job.ToUpperInvariant();
-    return name.StartsWith('_') || name.StartsWith("STATUS_") || name.StartsWith("LESEN_") || name.EndsWith("_LESEN")
+    return name is "_JOBS" or "_JOBCOMMENTS" or "_ARGUMENTS" or "_RESULTS" or "_VERSIONINFO" or "_TABLES" or "_TABLE"
+        || name.StartsWith("STATUS_") || name.StartsWith("LESEN_") || name.EndsWith("_LESEN")
         || name is "IDENT" or "IDENT_AIF" or "INFO" or "ECU_CONFIG";
 }
 
@@ -233,6 +248,10 @@ string ErrorText(Exception ex) => ex switch
 // results left as zeros or garbage; such results must never be treated as data.
 void EnsureOkay(JsonArray sets)
 {
+    if (sets.Count < 2)
+    {
+        throw new InvalidOperationException("the job returned no result sets");
+    }
     foreach (var set in sets)
     {
         if (set!["JOB_STATUS"] is JsonNode status && status.GetValue<string>() != "OKAY")
@@ -308,8 +327,12 @@ JsonObject RunLog()
     string[] SplitJobs(string list) => list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     string[] jobs = SplitJobs(opts["jobs"]);
     string[] slowJobs = SplitJobs(opts["slow-jobs"]);
-    int slowEvery = Math.Max(1, int.Parse(opts["slow-every"], CultureInfo.InvariantCulture));
+    int slowEvery = int.Parse(opts["slow-every"], CultureInfo.InvariantCulture);
     double duration = double.Parse(opts["duration"], CultureInfo.InvariantCulture);
+    if (slowEvery < 1 || !double.IsFinite(duration) || duration < 0)
+    {
+        throw new ArgumentException("--slow-every must be >= 1; --duration must be finite and >= 0");
+    }
     string logPath = Path.Combine(traceDir, "log.jsonl");
     if (jobs.Length == 0)
     {

@@ -25,7 +25,7 @@ needs the SGBD files (`.prg`, `.grp`) from your own EDIABAS/INPA installation, e
 `vendor/README.md` for where felkod expects them.
 
 Use at your own risk. felkod only reads by default; anything that changes the car needs an explicit flag
-(see Safety). It does not flash ECUs.
+(see Safety). No flashing workflow is implemented.
 
 ## Requirements
 
@@ -37,15 +37,24 @@ Use at your own risk. felkod only reads by default; anything that changes the ca
 ## Setup
 
 ```
-git clone --recurse-submodules <this repo> && cd felkod
-# copy your EDIABAS Ecu folder to vendor/bmw/ediabas/ecu (or pass --ecu-path to felkodd)
+git clone --recurse-submodules https://github.com/estridell/felkod.git
+cd felkod
+# copy your EDIABAS Ecu folder to vendor/bmw/ediabas/ecu
 dotnet build -c Release daemon
+mkdir -p ~/.local/bin
 ln -s "$PWD/cli/felkod" ~/.local/bin/felkod
 ```
 
+Add `~/.local/bin` to your `PATH` if needed. For an existing checkout, run
+`git submodule update --init --recursive` before building. To keep your SGBDs elsewhere, start with
+`felkod daemon start --ecu-path /path/to/Ecu`; subsequent CLI calls use that running daemon.
+Stop it before changing its port, SGBD or ECU path.
+
 Linux serial access: install `spike/99-felkod.rules` into `/etc/udev/rules.d/` (1 ms FTDI latency timer,
 `/dev/felkod-kline` symlink) and add your user to the group that owns the port (`uucp` on Arch,
-`dialout` on Debian/Ubuntu).
+`dialout` on Debian/Ubuntu). The rule keeps the distribution's serial group. Reload with
+`sudo udevadm control --reload-rules`, replug the cable, and log out and back in after changing groups.
+If you have several FTDI cables, narrow the rule by serial number to avoid an ambiguous symlink.
 
 ## Use
 
@@ -61,8 +70,9 @@ felkod sessions
 felkod session query <id> "SELECT t, name, value, unit FROM series WHERE name LIKE 'STAT_MOTORDREHZAHL%'"
 ```
 
-Every command prints one JSON object: `{"ok": true, "data": ..., "warnings": [...]}` or
+Commands print one JSON object: `{"ok": true, "data": ..., "warnings": [...]}` or
 `{"ok": false, "error": {"code": ..., "message": ...}}`; exit status 0 = ok, 1 = error, 2 = usage.
+Help and usage errors are plain text.
 The daemon (`felkodd`) starts on first use and owns the cable; a faults read while a log runs is
 interleaved between log steps. `skill/SKILL.md` is the full CLI reference for agents, generated from
 `--help`.
@@ -75,6 +85,10 @@ again with `felkod ds2 decode`.
 
 Sessions live in `~/.local/share/felkod/sessions/<id>/` (`session.sqlite`, `meta.json`, raw telegram
 trace `ifh.trc`); `felkod session show <id>` lists the tables.
+`XDG_DATA_HOME` overrides the data root. Session queries accept `SELECT`/`WITH`, including SQLite
+functions; writes, `ATTACH`, `VACUUM` and `PRAGMA` are refused. Use `--limit` to bound returned rows.
+Native telegrams are in SQLite's `raw` table; `ifh.trc` contains exchanges made through EdiabasLib.
+Sessions and traces may contain VINs and other vehicle identifiers; review them before sharing.
 
 ## Safety
 
@@ -83,7 +97,32 @@ trace `ifh.trc`); `felkod session show <id>` lists the tables.
   `~/.local/share/felkod/audit.jsonl` before clearing; every write is recorded there.
 - `ds2 raw` sends only telegrams that a read-only SGBD job sends, unless `--allow-write`.
 - Replies are only decoded when their DS2 status is OK by BMW's own status table and their length
-  matches earlier good replies, so a rejected or truncated reply never becomes data.
+  matches earlier good replies for the same single-telegram request. Length checking is learned:
+  it cannot identify the first short reply, and multi-telegram jobs can legitimately vary in length.
+
+Read-only classification follows MS43 job-name conventions (`STATUS_*`, `LESEN_*`, `*_LESEN`,
+`IDENT`, `IDENT_AIF`, `INFO`, `ECU_CONFIG`) plus the built-in metadata jobs. It is not an analysis of
+SGBD bytecode: use trusted, reviewed SGBDs, especially when experimenting with another ECU.
+The daemon socket is accessible only to its owner, who can explicitly authorize writes.
+
+## Development
+
+From a checkout with submodules initialized:
+
+```
+dotnet build -c Release daemon
+dotnet build -c Release spike
+dotnet run --project tests -c Release
+python3 -m unittest discover -s tests -v
+python3 skill/generate.py
+git diff --exit-code -- skill/SKILL.md
+```
+
+These checks run in CI on Linux with .NET 10 and Python 3.12. They use upstream EdiabasLib's test
+SGBD, temporary session databases and a pseudo-terminal ECU; no BMW files, cable or car are required. They cover interpreter
+isolation, write guards, session persistence, concurrent log starts, CLI options and read-only SQL.
+They do not establish real-car transport behavior. Native DS2 still needs on-car validation before
+being treated as production-ready. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
 
 ## Layout
 

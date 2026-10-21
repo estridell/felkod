@@ -12,6 +12,9 @@
     <EdiabasLibDir>$(MSBuildThisFileDirectory)../vendor/ediabaslib/EdiabasLib/EdiabasLib/</EdiabasLibDir>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Felkod.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <Compile Include="$(EdiabasLibDir)*.cs" Exclude="$(EdiabasLibDir)*Android.cs;$(EdiabasLibDir)BtLeGattSpp.cs" Link="EdiabasLib/%(Filename)%(Extension)" />
   </ItemGroup>
   <ItemGroup>

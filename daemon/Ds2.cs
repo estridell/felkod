@@ -4,7 +4,8 @@ using System.IO.Ports;
 namespace Felkod.Daemon;
 
 // Times in ms from the start of writing the request: echo complete, first reply byte (after the echo), reply complete.
-sealed record Ds2Exchange(byte[] Request, byte[] Response, double EchoMs, double FirstByteMs, double TotalMs, double WaitedMs, int Retries = 0);
+sealed record Ds2Exchange(byte[] Request, byte[] Response, double EchoMs, double FirstByteMs, double TotalMs, double WaitedMs,
+    int Retries = 0, DateTime? SentAt = null);
 
 // Native DS2 over the K+DCAN cable: 9600 baud 8E1, telegram = address, total length, payload, XOR checksum.
 // The cable echoes every byte sent (single-wire K-line), so the echo is read back and checked first.
@@ -75,6 +76,7 @@ sealed class Ds2Port : IDisposable
         {
             port.DiscardInBuffer();
             var clock = Stopwatch.StartNew();
+            var sentAt = DateTime.UtcNow;
             port.Write(request, 0, request.Length);
             var echo = ReadExactly(request.Length, EchoTimeoutMs + request.Length * ByteMs);
             if (echo == null || !echo.AsSpan().SequenceEqual(request))
@@ -85,12 +87,18 @@ sealed class Ds2Port : IDisposable
             }
             double echoMs = clock.Elapsed.TotalMilliseconds;
 
-            var head = ReadExactly(2, firstByteTimeoutMs);
-            if (head == null)
+            var address = ReadExactly(1, firstByteTimeoutMs);
+            if (address == null)
             {
                 throw new FelkodException("link", "no response from the ECU", isLink: true);
             }
             double firstByteMs = clock.Elapsed.TotalMilliseconds - echoMs;
+            var lengthByte = ReadExactly(1, ByteMs + interByteTimeoutMs);
+            if (lengthByte == null)
+            {
+                throw new FelkodException(Corrupt, "reply cut short after its address byte", isLink: true);
+            }
+            byte[] head = [address[0], lengthByte[0]];
             int length = head[1];
             if (length < 4 || head[0] != request[0])
             {
@@ -110,7 +118,7 @@ sealed class Ds2Port : IDisposable
             }
             lastResponseEnd = Stopwatch.GetTimestamp();
             return new Ds2Exchange(request, response, Math.Round(echoMs, 2), Math.Round(firstByteMs, 2),
-                Math.Round(clock.Elapsed.TotalMilliseconds, 2), Math.Round(waitedMs, 2));
+                Math.Round(clock.Elapsed.TotalMilliseconds, 2), Math.Round(waitedMs, 2), SentAt: sentAt);
         }
         catch (FelkodException)
         {

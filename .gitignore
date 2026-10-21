@@ -30,3 +30,6 @@ vendor/community/
 
 # DME flash reads (MS4x Flasher .bin files)
 firmware/
+
+# Local audit scratch files
+work/

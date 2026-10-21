@@ -5,8 +5,9 @@ It compiles EdiabasLib's sources (submodule in `vendor/ediabaslib`) for `net10.0
 only targets Windows and Android. Output is JSON; raw EDIABAS/IFH traces land in `traces/<timestamp>/`.
 
 ```
+cd spike
 dotnet build -c Release
-alias spike=./bin/Release/net10.0/felkod-spike
+spike() { ./bin/Release/net10.0/felkod-spike "$@"; }
 spike jobs                          # offline: list MS430DS0.prg jobs
 spike results STATUS_MESSWERTEBLOCK # offline: a job's results
 spike run IDENT                     # needs the car
@@ -27,10 +28,17 @@ a fresh connection is probed every second (`still_down` every 10 s), and logging
 logging continues. Stop with Ctrl+C, or `kill -TERM <pid>` for a background run; the summary is
 printed and traces are flushed. A second signal exits immediately.
 
-## One-time setup (done 2026-10-21)
+## One-time setup
 
-- `dotnet-sdk` (10.0) installed, user added to `uucp` (log out and in once)
-- `99-felkod.rules` copied to `/etc/udev/rules.d/`: 1 ms FTDI latency, `/dev/felkod-kline` symlink
+- Install the .NET 10 SDK and initialize the EdiabasLib submodule from the repository root.
+- Supply your own SGBDs as described in `../vendor/README.md`, or pass `--ecu-path /path/to/Ecu`.
+- Add your user to the serial port's group (`uucp` on Arch, `dialout` on Debian/Ubuntu), then log out and in.
+- Install `99-felkod.rules` in `/etc/udev/rules.d/`, run `sudo udevadm control --reload-rules`, and
+  replug the cable: 1 ms FTDI latency, `/dev/felkod-kline` symlink.
+
+This is an experimental standalone program. Stop felkodd (`felkod daemon stop`) before using it:
+both programs need exclusive access to the cable. Prefer the main CLI for routine diagnostics and
+audited writes; the spike does not implement the daemon's fault-clear backup or reply-length guard.
 
 ## In the car
 

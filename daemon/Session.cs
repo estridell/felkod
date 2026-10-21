@@ -61,16 +61,28 @@ sealed class Session : IDisposable
         id = Path.GetFileName(dir);
         Directory.CreateDirectory(dir);
 
-        var db = new SqliteConnection($"Data Source={Path.Combine(dir, "session.sqlite")}");
-        db.Open();
-        Exec(db, Schema);
-        meta["id"] = id;
-        var session = new Session(id, dir, db, meta);
-        foreach (var (key, value) in meta.ToList())
+        var db = new SqliteConnection(new SqliteConnectionStringBuilder
         {
-            session.SetMeta(key, value);
+            DataSource = Path.Combine(dir, "session.sqlite"),
+        }.ToString());
+        try
+        {
+            db.Open();
+            Exec(db, Schema);
+            meta["id"] = id;
+            var session = new Session(id, dir, db, meta);
+            foreach (var (key, value) in meta.ToList())
+            {
+                session.SetMeta(key, value);
+            }
+            return session;
         }
-        return session;
+        catch
+        {
+            db.Dispose();
+            Directory.Delete(dir, recursive: true);
+            throw;
+        }
     }
 
     static void Exec(SqliteConnection db, string sql)

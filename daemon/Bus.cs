@@ -99,13 +99,16 @@ sealed class Bus : IDisposable
     public Task<JsonNode?> Submit(Func<JsonNode?> run)
     {
         var done = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (shuttingDown)
+        lock (queue)
         {
-            done.SetException(new FelkodException("shutting_down", "felkodd is shutting down"));
-        }
-        else
-        {
-            queue.Add(new Work(run, done, RequestLabel.Value ?? "request"));
+            if (shuttingDown)
+            {
+                done.SetException(new FelkodException("shutting_down", "felkodd is shutting down"));
+            }
+            else
+            {
+                queue.Add(new Work(run, done, RequestLabel.Value ?? "request"));
+            }
         }
         return done.Task;
     }
@@ -183,7 +186,15 @@ sealed class Bus : IDisposable
         Execute(work);
         if (Log is LogRun log && sw.Elapsed.TotalSeconds > PauseEventSeconds)
         {
-            log.Paused(sw.Elapsed.TotalSeconds, work.Label);
+            try
+            {
+                log.Paused(sw.Elapsed.TotalSeconds, work.Label);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"felkodd: recording a pause failed: {ex}");
+                log.InternalError(ex);
+            }
         }
     }
 
@@ -214,6 +225,7 @@ sealed class Bus : IDisposable
         observed.Exchanges.Clear();
         lock (Sgbd.Gate)
         {
+            Sgbd.Activate(e);
             jobClock.Restart();
             try
             {
@@ -257,6 +269,7 @@ sealed class Bus : IDisposable
         {
             var (request, response) = observed.Exchanges[0];
             guard.Check(request, response);
+            Results.EnsureOkay(sets!);
             guard.Learn(request, response);
         }
         return sets!;
@@ -290,6 +303,7 @@ sealed class Bus : IDisposable
         var sets = decoder.Decode(job, args, request, exchange.Response);
         if (sets != null)
         {
+            Results.EnsureOkay(sets);
             guard.Learn(request, exchange.Response);
             return (sets, exchange);
         }
@@ -388,7 +402,11 @@ sealed class Bus : IDisposable
             // Closes EdiabasLib's static serial port and stops its foreground comm thread.
             lock (Sgbd.Gate)
             {
-                ediabas?.Dispose();
+                if (ediabas != null)
+                {
+                    Sgbd.Activate(ediabas);
+                    ediabas.Dispose();
+                }
             }
         }
         catch (Exception)
@@ -423,15 +441,23 @@ sealed class Bus : IDisposable
         var run = Log!;
         // finish first: a status call meanwhile still finds the run, and a session's meta has its
         // summary by the time it stops being "running"
-        var summary = run.Finish();
-        Log = null;
-        SetTraceDir(config.TraceDir);
-        return summary;
+        try
+        {
+            return run.Finish();
+        }
+        finally
+        {
+            Log = null;
+            SetTraceDir(config.TraceDir);
+        }
     }
 
     public void Stop()
     {
-        shuttingDown = true;
+        lock (queue)
+        {
+            shuttingDown = true;
+        }
         worker.Join(TimeSpan.FromSeconds(config.JobTimeoutS + 5));
     }
 
@@ -491,6 +517,7 @@ sealed class Catalog
         {
             lock (Sgbd.Gate)
             {
+                Sgbd.Activate(ediabas);
                 ediabas.ArgString = args;
                 ediabas.ArgBinaryStd = null;
                 ediabas.ResultsRequests = "";

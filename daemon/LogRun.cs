@@ -170,11 +170,12 @@ sealed class LogRun
         var sw = Stopwatch.StartNew();
         var (sets, exchange) = nativeGapMs is int gap ? bus.RunJobNative(job, "", gap) : (bus.RunJob(job), null);
         Results.EnsureOkay(sets);
-        if (exchange != null)
+        if (exchange?.SentAt is DateTime sentAt)
         {
-            // native: stamp the moment the request went out, after the gap wait
-            startedAt = startedAt.AddMilliseconds(exchange.WaitedMs);
-            startedElapsed = Math.Round(startedElapsed + exchange.WaitedMs / 1000, 3);
+            // Stamp the actual final request, including time spent opening the port, decoding
+            // the request and retrying a corrupt exchange, rather than just adding the gap.
+            startedElapsed = Math.Round(startedElapsed + (sentAt - startedAt).TotalSeconds, 3);
+            startedAt = sentAt;
         }
         session.AddSample(startedAt, startedElapsed, sampleCycle, job, Math.Round(sw.Elapsed.TotalMilliseconds, 1), sets, exchange);
         bool firstFallback = false;
@@ -268,9 +269,15 @@ sealed class LogRun
     {
         var summary = Status();
         summary["ended_at"] = DateTime.UtcNow.ToString("o");
-        session.SetMeta("ended_at", summary["ended_at"]);
-        session.SetMeta("summary", summary.DeepClone());
-        session.Dispose();
+        try
+        {
+            session.SetMeta("ended_at", summary["ended_at"]);
+            session.SetMeta("summary", summary.DeepClone());
+        }
+        finally
+        {
+            session.Dispose();
+        }
         return summary;
     }
 }

@@ -93,10 +93,13 @@ static class Results
         name.EndsWith("_WERT") && set[name[..^"_WERT".Length] + "_EINH"] is JsonNode unit ? unit.GetValue<string>() : null;
 
     // Jobs that only read. Anything else (STEUERN_*, *_LOESCHEN, *_PROGRAMMIEREN, ...) changes the car.
+    public static bool IsMetadataJob(string job) => job.ToUpperInvariant() is
+        "_JOBS" or "_JOBCOMMENTS" or "_ARGUMENTS" or "_RESULTS" or "_VERSIONINFO" or "_TABLES" or "_TABLE";
+
     public static bool IsReadOnlyJob(string job)
     {
         string name = job.ToUpperInvariant();
-        return name.StartsWith('_') || name.StartsWith("STATUS_") || name.StartsWith("LESEN_") || name.EndsWith("_LESEN")
+        return IsMetadataJob(name) || name.StartsWith("STATUS_") || name.StartsWith("LESEN_") || name.EndsWith("_LESEN")
             || name is "IDENT" or "IDENT_AIF" or "INFO" or "ECU_CONFIG";
     }
 }

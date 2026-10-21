@@ -1,10 +1,14 @@
 # vendor
 
-`vendor/bmw/` holds files taken from the BMW Standard Tools kit that came with the cable
-(`Inpa_2026_01_OBD_Specialisten.7z`, EDIABAS 7.3.0, NCS Expert 4.0.1, data files v74).
-They are BMW's proprietary files, so the directory is gitignored. Never commit it or ship it.
+`vendor/ediabaslib/` is the pinned upstream EdiabasLib submodule (GPLv3). Initialize it with
+`git submodule update --init --recursive` from the repository root.
 
-| Path | From the kit | Used for |
+`vendor/bmw/` is an optional local directory for files from your own EDIABAS/INPA installation.
+Those files are proprietary and are not supplied by this project. The directory is gitignored;
+never commit it or ship it. Only the ECU folder is needed to run felkod; the other paths below
+are optional reference material.
+
+| Path | From your installation | Used for |
 | --- | --- | --- |
 | `bmw/ediabas/ecu/` | `EDIABAS/Ecu` | SGBDs (`.prg`) and group files (`.grp`) that EdiabasLib executes. MS43 is `MS430DS0.prg`, resolved via `d_motor.grp` |
 | `bmw/ediabas/doku/` | `EDIABAS/Doku` | EDIABAS reference (BEST/2, API, FAQ) |
@@ -13,10 +17,10 @@ They are BMW's proprietary files, so the directory is gitignored. Never commit i
 | `bmw/inpa/cfgdat/` | `EC-APPS/INPA/CFGDAT` | INPA menu config per chassis (`E46.ENG`) |
 | `bmw/ncs/daten-e46/` | `NCSEXPER/DATEN/E46` | NCS Expert coding data for the E46 |
 | `bmw/ncs/sgdat/` | `NCSEXPER/SGDAT` | NCS Expert SGBDs |
-| `bmw/docs/` | kit root | E46 code list, ECU lists, INPA FAQ, install guide |
+| `bmw/docs/` | documentation | E46 code list, ECU lists, INPA FAQ, install guide |
 
 Note: file names in `ecu/` mix upper and lower case (`d_motor.grp`, `D_MOTOR2.grp`).
 Linux is case sensitive, so check how EdiabasLib resolves names before renaming anything.
 
-To repopulate, extract those folders from the kit archive (the password is in the seller's download info)
-into the paths above.
+Copy your ECU folder into `vendor/bmw/ediabas/ecu/`, or use
+`felkod daemon start --ecu-path /path/to/Ecu`. The project does not provide downloads for BMW files.
