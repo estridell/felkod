@@ -1,0 +1,5 @@
+# felkod: K+DCAN cable (FTDI FT232RL, 0403:6001).
+# 1 ms latency timer instead of the 16 ms default; K-line round trips are latency bound.
+ACTION=="add", SUBSYSTEM=="usb-serial", DRIVERS=="ftdi_sio", ATTR{latency_timer}="1"
+# Stable name and access for the uucp group.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="felkod-kline", GROUP="uucp", MODE="0660"
