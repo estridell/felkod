@@ -4,7 +4,7 @@ Agent-first diagnostics for a 2002 BMW E46 320Ci (M54B22, Siemens MS43), built o
 [EdiabasLib](https://github.com/uholeschak/ediabaslib).
 
 The goal is INPA / NCS Expert / MS4X Flasher / TunerPro functionality behind one CLI
-that returns structured JSON, with background logging and built-in MS43 knowledge.
+that returns structured JSON, with background logging. Agents do their own research on MS43 internals.
 
 Status: planning. Nothing is built yet.
 
