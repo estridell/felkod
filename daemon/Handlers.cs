@@ -6,8 +6,12 @@ namespace Felkod.Daemon;
 
 // The daemon's methods. Everything that talks to the ECU goes through the bus thread;
 // metadata comes from the offline catalog. Output is the SGBD's own names, values and units.
-sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShutdown)
+sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decoder, Action requestShutdown)
 {
+    // BMW's regeneration time for MS43 DS2; the native default until a shorter gap is measured safe.
+    const int DefaultGapMs = 100;
+    HashSet<string>? readOnlyTelegrams;
+
     // Below this, clearing faults is refused: a sagging battery mid-write is how ECUs get confused.
     const double MinWriteVoltage = 11.5;
 
@@ -23,6 +27,10 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
         "faults.read" => await FaultsRead(),
         "faults.clear" => await FaultsClear(OptBool(p, "confirm")),
         "log.start" => await LogStart(p, warnings),
+        "bench" => await Bench(Str(p, "job"), p["n"]?.GetValue<int>() ?? 20, OptBool(p, "native"), Gap(p)),
+        "ds2.request" => Ds2Request(Str(p, "job"), OptStr(p, "args") ?? ""),
+        "ds2.decode" => Ds2Decode(Str(p, "job"), OptStr(p, "args") ?? "", Str(p, "response")),
+        "ds2.raw" => await Ds2Raw(Str(p, "request"), Gap(p), OptBool(p, "allow_write")),
         "log.stop" => await bus.Submit(bus.StopLog),
         "log.status" => bus.Log?.Status() ?? new JsonObject { ["running"] = false },
         "sessions.list" => SessionsList(),
@@ -36,6 +44,20 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
     static string? OptStr(JsonObject p, string key) => p[key]?.GetValue<string>();
 
     static bool OptBool(JsonObject p, string key) => p[key]?.GetValue<bool>() ?? false;
+
+    static int Gap(JsonObject p) => p["gap_ms"]?.GetValue<int>() ?? DefaultGapMs;
+
+    static byte[] Hex(string text)
+    {
+        try
+        {
+            return Convert.FromHexString(text.Replace(" ", ""));
+        }
+        catch (FormatException)
+        {
+            throw new FelkodException("bad_request", $"not hex: {text}");
+        }
+    }
 
     static string[] StrList(JsonObject p, string key) =>
         p[key] is JsonArray list ? list.Select(item => item!.GetValue<string>()).ToArray() : [];
@@ -196,8 +218,18 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
             ["sgbd"] = catalog.SgbdFile,
             ["port"] = config.Port,
         };
+        int? nativeGapMs = OptBool(p, "native") ? Gap(p) : null;
+        meta["native_gap_ms"] = nativeGapMs;
+        if (nativeGapMs != null)
+        {
+            var notNative = jobs.Concat(slowJobs).Where(job => decoder.RequestFor(job) == null).ToList();
+            if (notNative.Count > 0)
+            {
+                warnings.Add($"not single-telegram jobs, logged through EdiabasLib: {string.Join(", ", notNative)}");
+            }
+        }
         var session = Session.Create(config.SessionsDir, meta);
-        var run = new LogRun(session, jobs, slowJobs, slowEvery, durationS);
+        var run = new LogRun(session, jobs, slowJobs, slowEvery, durationS, nativeGapMs);
         try
         {
             await bus.Submit(() =>
@@ -217,6 +249,140 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
             warnings.Add($"port {config.Port} does not exist; logging will wait for it");
         }
         return new JsonObject { ["session_id"] = session.Id, ["dir"] = session.Dir };
+    }
+
+    // Times a job n times. Native runs also report the ECU's reply latency (first byte after the echo).
+    async Task<JsonNode?> Bench(string job, int n, bool native, int gapMs)
+    {
+        catalog.RequireJobs([job]);
+        if (!Results.IsReadOnlyJob(job))
+        {
+            throw new FelkodException("write_not_allowed", $"bench only runs read-only jobs: {job}");
+        }
+        if (n < 2)
+        {
+            throw new FelkodException("bad_request", "bench needs n >= 2");
+        }
+        if (native && decoder.RequestFor(job) == null)
+        {
+            throw new FelkodException("not_native", $"{job} does not send exactly one telegram; bench it without native");
+        }
+        return await bus.Submit(() =>
+        {
+            var totals = new List<double>();
+            var latencies = new List<double>();
+            var errors = new JsonArray();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < n; i++)
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                try
+                {
+                    var (sets, exchange) = native ? bus.RunJobNative(job, "", gapMs) : (bus.RunJob(job), null);
+                    Results.EnsureOkay(sets);
+                    totals.Add(sw.Elapsed.TotalMilliseconds);
+                    if (exchange != null)
+                    {
+                        latencies.Add(exchange.FirstByteMs);
+                    }
+                }
+                catch (FelkodException ex) when (ex.Code != "shutting_down")
+                {
+                    errors.Add(new JsonObject { ["run"] = i, ["code"] = ex.Code, ["error"] = ex.Message });
+                }
+            }
+            double seconds = clock.Elapsed.TotalSeconds;
+            return new JsonObject
+            {
+                ["job"] = job,
+                ["native"] = native,
+                ["gap_ms"] = native ? gapMs : null,
+                ["runs"] = n,
+                ["ok"] = totals.Count,
+                ["failed"] = errors.Count,
+                ["per_s"] = Math.Round(totals.Count / seconds, 2),
+                ["job_ms"] = Stats(totals),
+                ["ecu_first_byte_ms"] = native ? Stats(latencies) : null,
+                ["errors"] = errors,
+            };
+        });
+    }
+
+    static JsonObject? Stats(List<double> values)
+    {
+        if (values.Count == 0)
+        {
+            return null;
+        }
+        var sorted = values.Order().ToList();
+        double Pct(double q) => Math.Round(sorted[(int)Math.Round(q * (sorted.Count - 1))], 2);
+        return new JsonObject { ["min"] = Pct(0), ["median"] = Pct(0.5), ["p90"] = Pct(0.9), ["max"] = Pct(1) };
+    }
+
+    JsonObject Ds2Request(string job, string args)
+    {
+        catalog.RequireJobs([job]);
+        var request = decoder.RequestFor(job, args);
+        return new JsonObject
+        {
+            ["job"] = job,
+            ["args"] = args,
+            ["native"] = request != null,
+            ["request"] = request == null ? null : Convert.ToHexString(request),
+        };
+    }
+
+    JsonObject Ds2Decode(string job, string args, string responseHex)
+    {
+        catalog.RequireJobs([job]);
+        var request = decoder.RequestFor(job, args)
+            ?? throw new FelkodException("not_native", $"{job} does not send exactly one telegram");
+        var sets = decoder.Decode(job, args, request, Hex(responseHex))
+            ?? throw new FelkodException("decode_failed", $"{job} could not decode that reply");
+        return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(sets) };
+    }
+
+    // A raw telegram. Without allow_write only telegrams that a read-only SGBD job sends are allowed.
+    async Task<JsonNode?> Ds2Raw(string requestHex, int gapMs, bool allowWrite)
+    {
+        var request = Hex(requestHex);
+        if (request.Length >= 2 && request.Length == request[1] - 1)
+        {
+            request = [.. request, Ds2Port.Checksum(request)];
+        }
+        if (request.Length < 4 || request.Length != request[1] || Ds2Port.Checksum(request.AsSpan(0, request.Length - 1)) != request[^1])
+        {
+            throw new FelkodException("bad_request", $"not a DS2 telegram: {Convert.ToHexString(request)}");
+        }
+        if (!allowWrite)
+        {
+            readOnlyTelegrams ??= catalog.JobNames().Where(Results.IsReadOnlyJob)
+                .Select(job => decoder.RequestFor(job)).OfType<byte[]>()
+                .Select(Convert.ToHexString).ToHashSet();
+            if (!readOnlyTelegrams.Contains(Convert.ToHexString(request)))
+            {
+                throw new FelkodException("write_not_allowed",
+                    "not a telegram any read-only SGBD job sends; pass allow_write to send it anyway");
+            }
+        }
+        if (allowWrite)
+        {
+            Audit("ds2.raw", new JsonObject { ["request"] = Convert.ToHexString(request) });
+        }
+        return await bus.Submit(() =>
+        {
+            var exchange = bus.RawExchange(request, gapMs);
+            return new JsonObject
+            {
+                ["request"] = Convert.ToHexString(exchange.Request),
+                ["response"] = Convert.ToHexString(exchange.Response),
+                ["status"] = $"{exchange.Response[2]:X2}",
+                ["echo_ms"] = exchange.EchoMs,
+                ["first_byte_ms"] = exchange.FirstByteMs,
+                ["total_ms"] = exchange.TotalMs,
+                ["waited_ms"] = exchange.WaitedMs,
+            };
+        });
     }
 
     JsonObject SessionsList()

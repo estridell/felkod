@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "cli" / "felkod"
-COMMANDS = ["status", "daemon", "ident", "faults", "jobs", "run", "read", "log", "sessions", "session"]
+COMMANDS = ["status", "daemon", "ident", "faults", "jobs", "run", "read", "log", "bench", "ds2", "sessions", "session"]
 
 
 def help_text(*args):

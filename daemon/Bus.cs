@@ -57,21 +57,29 @@ sealed class Bus : IDisposable
 {
     record Work(Func<JsonNode?> Run, TaskCompletionSource<JsonNode?> Done);
 
+    // DS2's first-byte timeout as the MS43 SGBD sets it (ms), and the gap allowed between reply bytes.
+    const int Ds2FirstByteTimeoutMs = 2000;
+    const int Ds2InterByteTimeoutMs = 20;
+
     readonly Config config;
+    readonly SgbdDecoder decoder;
     readonly BlockingCollection<Work> queue = new();
     readonly Thread worker;
     readonly Stopwatch jobClock = new();
     volatile bool shuttingDown;
     EdiabasNet? ediabas;
+    // Native DS2 and EdiabasLib take turns on the port: opening one closes the other.
+    Ds2Port? native;
     bool needsReset = true;
     string traceDir;
 
     public LinkState Link { get; } = new();
     public LogRun? Log { get; private set; }
 
-    public Bus(Config config)
+    public Bus(Config config, SgbdDecoder decoder)
     {
         this.config = config;
+        this.decoder = decoder;
         traceDir = config.TraceDir;
         Directory.CreateDirectory(traceDir);
         worker = new Thread(Loop) { Name = "felkod-bus", IsBackground = true };
@@ -147,6 +155,7 @@ sealed class Bus : IDisposable
             pending.Done.TrySetException(new FelkodException("shutting_down", "felkodd is shutting down"));
         }
         DisposeInstance();
+        CloseNative();
     }
 
     static void Execute(Work work)
@@ -218,10 +227,66 @@ sealed class Bus : IDisposable
         needsReset = true;
     }
 
-    public void ForceReset() => needsReset = true;
+    public void ForceReset()
+    {
+        needsReset = true;
+        CloseNative();
+    }
+
+    // Runs a job with native DS2 transport and SGBD decoding when the job sends a single telegram;
+    // otherwise (or if the decode does not fit) through EdiabasLib. Returns the raw exchange if native.
+    public (JsonArray Sets, Ds2Exchange? Raw) RunJobNative(string job, string args, int gapMs)
+    {
+        var request = decoder.RequestFor(job, args);
+        if (request == null)
+        {
+            return (RunJob(job, args), null);
+        }
+        var exchange = RawExchange(request, gapMs);
+        var sets = decoder.Decode(job, args, request, exchange.Response);
+        if (sets == null)
+        {
+            return (RunJob(job, args), null);
+        }
+        return (sets, exchange);
+    }
+
+    // One telegram on the wire, native. IsLink failures close the port so the next call reopens it.
+    public Ds2Exchange RawExchange(byte[] request, int gapMs)
+    {
+        if (shuttingDown)
+        {
+            throw new FelkodException("shutting_down", "felkodd is shutting down");
+        }
+        DisposeInstance();
+        try
+        {
+            native ??= new Ds2Port(config.Port);
+            var exchange = native.Transact(request, gapMs, Ds2FirstByteTimeoutMs, Ds2InterByteTimeoutMs);
+            Link.Ok();
+            return exchange;
+        }
+        catch (FelkodException ex) when (ex.IsLink)
+        {
+            CloseNative();
+            Link.Failed(ex.Message, isLink: true);
+            throw;
+        }
+    }
+
+    void CloseNative()
+    {
+        native?.Dispose();
+        native = null;
+    }
 
     void EnsureInstance()
     {
+        if (native != null)
+        {
+            CloseNative();
+            needsReset = true;
+        }
         if (ediabas != null && !needsReset)
         {
             return;
