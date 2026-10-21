@@ -22,10 +22,10 @@ sessions/
 # Spike traces (raw EDIABAS/IFH logs)
 spike/traces/
 
-# devtools build output
-devtools/build/
+# Developer tools: a separate (private) git repo checked out here
+devtools/
 
-# Community definitions without a published licence (devtools/fetch_community.sh)
+# Community definitions without a published licence (fetched by a dev script)
 vendor/community/
 
 # DME flash reads (MS4x Flasher .bin files)
