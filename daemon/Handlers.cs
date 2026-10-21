@@ -10,6 +10,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
 {
     // BMW's regeneration time for MS43 DS2; the native default until a shorter gap is measured safe.
     const int DefaultGapMs = 100;
+    const int BenchMaxSeconds = 60;
     HashSet<string>? readOnlyTelegrams;
 
     // Below this, clearing faults is refused: a sagging battery mid-write is how ECUs get confused.
@@ -175,13 +176,15 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             {
                 throw new FelkodException("low_voltage", $"battery {ubatt:F2} V is below {MinWriteVoltage} V; charge it first");
             }
-            // The cleared faults are kept in the audit log, so clearing never loses them.
+            // The faults are saved to the audit log before the clear is sent, so clearing never loses them,
+            // even if the clear's reply is lost.
             var before = bus.RunJob("FS_LESEN");
             Results.EnsureOkay(before);
+            var faults = FaultList(before);
+            Audit("faults.clear", new JsonObject { ["stage"] = "sending", ["ubatt_v"] = ubatt, ["faults_before"] = faults.DeepClone() });
             var cleared = bus.RunJob("FS_LOESCHEN");
             Results.EnsureOkay(cleared);
-            var faults = FaultList(before);
-            Audit("faults.clear", new JsonObject { ["ubatt_v"] = ubatt, ["faults_before"] = faults.DeepClone() });
+            Audit("faults.clear", new JsonObject { ["stage"] = "done" });
             return new JsonObject { ["cleared"] = true, ["ubatt_v"] = ubatt, ["faults_before"] = faults };
         });
     }
@@ -273,14 +276,28 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             var latencies = new List<double>();
             var errors = new JsonArray();
             var clock = System.Diagnostics.Stopwatch.StartNew();
+            int linkFailuresInARow = 0;
+            string? aborted = null;
             for (int i = 0; i < n; i++)
             {
+                // stay well inside the CLI's 90 s wait, and stop hammering an ECU that is not answering
+                if (clock.Elapsed.TotalSeconds > BenchMaxSeconds)
+                {
+                    aborted = $"stopped after {BenchMaxSeconds} s";
+                    break;
+                }
+                if (linkFailuresInARow >= 3)
+                {
+                    aborted = "stopped after 3 link failures in a row";
+                    break;
+                }
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
                     var (sets, exchange) = native ? bus.RunJobNative(job, "", gapMs) : (bus.RunJob(job), null);
                     Results.EnsureOkay(sets);
                     totals.Add(sw.Elapsed.TotalMilliseconds);
+                    linkFailuresInARow = 0;
                     if (exchange != null)
                     {
                         latencies.Add(exchange.FirstByteMs);
@@ -289,6 +306,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
                 catch (FelkodException ex) when (ex.Code != "shutting_down")
                 {
                     errors.Add(new JsonObject { ["run"] = i, ["code"] = ex.Code, ["error"] = ex.Message });
+                    linkFailuresInARow = ex.IsLink ? linkFailuresInARow + 1 : 0;
                 }
             }
             double seconds = clock.Elapsed.TotalSeconds;
@@ -297,7 +315,9 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
                 ["job"] = job,
                 ["native"] = native,
                 ["gap_ms"] = native ? gapMs : null,
-                ["runs"] = n,
+                ["runs"] = totals.Count + errors.Count,
+                ["requested"] = n,
+                ["aborted"] = aborted,
                 ["ok"] = totals.Count,
                 ["failed"] = errors.Count,
                 ["per_s"] = Math.Round(totals.Count / seconds, 2),

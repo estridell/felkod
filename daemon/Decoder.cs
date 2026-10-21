@@ -177,20 +177,15 @@ sealed class SgbdDecoder
         }
     }
 
-    // Decodes a captured reply into the job's result sets; null if the job does not fit
-    // (it wanted another telegram), in which case it is marked not native.
+    // Decodes a captured reply into the job's result sets; null if the job did not fit it
+    // (e.g. it wanted another telegram). Whether that makes the job not native is the caller's call.
     public JsonArray? Decode(string job, string args, byte[] request, byte[] response)
     {
         lock (gate)
         {
             decode.Answer(request, response);
             bool ok = Execute(job, args);
-            if (!ok || decode.Problem != null)
-            {
-                requests[job + "\0" + args] = null;
-                return null;
-            }
-            return Results.ToJson(ediabas.ResultSets);
+            return ok && decode.Problem == null ? Results.ToJson(ediabas.ResultSets) : null;
         }
     }
 
