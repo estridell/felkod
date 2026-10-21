@@ -1,0 +1,20 @@
+# BMW Standard Tools files from the cable kit: proprietary, ~1.4 GB. Kept locally, never committed.
+# See vendor/README.md for what lives there and how to repopulate it.
+vendor/bmw/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# .NET
+bin/
+obj/
+
+# felkod session data
+sessions/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
