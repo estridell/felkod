@@ -91,6 +91,8 @@ def call(method, params=None, autostart=True):
                 buffer += chunk
     except socket.timeout:
         raise Failure("daemon_timeout", f"no answer from felkodd within {CALL_TIMEOUT_S} s")
+    except (ConnectionResetError, BrokenPipeError):
+        raise Failure("daemon_gone", "felkodd closed the connection")
     except (FileNotFoundError, ConnectionRefusedError):
         raise Failure("daemon_not_running", "felkodd is not running; start it with: felkod daemon start")
     response = json.loads(buffer)
@@ -113,10 +115,10 @@ NATIVE_HELP = ("felkodd's own DS2 transport for jobs that send one telegram, dec
 GAP_HELP = "native: ms between a reply and the next request (default 100, BMW's regeneration time for MS43)"
 SESSION_TABLES = ("samples(id, t, elapsed_s, cycle, job, ms); readings(sample_id, set_index, name, value, text, unit); "
                   "events(id, t, elapsed_s, kind, job, detail); meta(key, value); "
-                  "raw(sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms) for native samples; "
+                  "raw(sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms, retries) for native samples; "
                   "view series(t, elapsed_s, job, set_index, name, value, text, unit). t is UTC ISO 8601 at job start; "
                   "names are the SGBD's result names; events.kind is link_lost, still_down, link_restored, job_error, "
-                  "not_native or internal_error")
+                  "not_native, internal_error or paused; meta values are JSON text")
 
 
 def jobs_arg(text):
@@ -141,7 +143,14 @@ def cmd_daemon(args):
             if getattr(args, flag):
                 extra += [f"--{flag.replace('_', '-')}", str(getattr(args, flag))]
         started = start_daemon(extra)
-        return {"started": started, "already_running": not started, "socket": str(socket_path())}
+        result = {"started": started, "already_running": not started, "socket": str(socket_path())}
+        if not started:
+            port = data("status")["port"]["path"]
+            result["port"] = port
+            if args.port and args.port != port:
+                WARNINGS.append(f"felkodd is already running on {port}; --port {args.port} was not applied "
+                                "(daemon stop first)")
+        return result
     if args.action == "stop":
         if not daemon_running():
             return {"stopped": False, "already_stopped": True}
@@ -157,6 +166,8 @@ def cmd_daemon(args):
             try:
                 os.kill(pid, 0)
             except ProcessLookupError:
+                return {"stopped": True, "pid": pid}
+            except PermissionError:  # another user's process with that pid: ours is gone
                 return {"stopped": True, "pid": pid}
             time.sleep(0.1)
         raise Failure("daemon_stop_failed", f"felkodd (pid {pid}) is still running after 30 s")

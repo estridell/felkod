@@ -55,7 +55,12 @@ sealed class LinkState
 // so a running log never blocks `faults read` or `ident` for longer than one job.
 sealed class Bus : IDisposable
 {
-    record Work(Func<JsonNode?> Run, TaskCompletionSource<JsonNode?> Done);
+    record Work(Func<JsonNode?> Run, TaskCompletionSource<JsonNode?> Done, string Label);
+
+    // What the current RPC call is (set by Handlers), so work that pauses a log can be named in it.
+    public static readonly AsyncLocal<string?> RequestLabel = new();
+    // Queued work that holds the bus longer than this while a log runs is recorded in the session.
+    const double PauseEventSeconds = 0.3;
 
     // DS2's first-byte timeout as the MS43 SGBD sets it (ms), and the gap allowed between reply bytes.
     const int Ds2FirstByteTimeoutMs = 2000;
@@ -63,6 +68,9 @@ sealed class Bus : IDisposable
 
     readonly Config config;
     readonly SgbdDecoder decoder;
+    readonly Catalog catalog;
+    // native: the length of the first OK reply per request; a different length later is not trusted
+    readonly Dictionary<string, int> replyLengths = new();
     readonly BlockingCollection<Work> queue = new();
     readonly Thread worker;
     readonly Stopwatch jobClock = new();
@@ -76,10 +84,11 @@ sealed class Bus : IDisposable
     public LinkState Link { get; } = new();
     public LogRun? Log { get; private set; }
 
-    public Bus(Config config, SgbdDecoder decoder)
+    public Bus(Config config, SgbdDecoder decoder, Catalog catalog)
     {
         this.config = config;
         this.decoder = decoder;
+        this.catalog = catalog;
         traceDir = config.TraceDir;
         Directory.CreateDirectory(traceDir);
         worker = new Thread(Loop) { Name = "felkod-bus", IsBackground = true };
@@ -96,7 +105,7 @@ sealed class Bus : IDisposable
         }
         else
         {
-            queue.Add(new Work(run, done));
+            queue.Add(new Work(run, done, RequestLabel.Value ?? "request"));
         }
         return done.Task;
     }
@@ -107,14 +116,21 @@ sealed class Bus : IDisposable
         {
             if (queue.TryTake(out var work))
             {
-                Execute(work);
+                ExecuteNoting(work);
                 continue;
             }
             if (Log is LogRun log)
             {
                 if (log.Finished)
                 {
-                    FinishLog();
+                    try
+                    {
+                        FinishLog();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"felkodd: finishing the log failed: {ex}");
+                    }
                     continue;
                 }
                 bool worked;
@@ -132,7 +148,7 @@ sealed class Bus : IDisposable
                 }
                 if (!worked && queue.TryTake(out work, 100))
                 {
-                    Execute(work);
+                    ExecuteNoting(work);
                 }
                 continue;
             }
@@ -160,6 +176,17 @@ sealed class Bus : IDisposable
         CloseNative();
     }
 
+    // Runs queued work; if it held up a running log noticeably, the session records a paused event.
+    void ExecuteNoting(Work work)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Execute(work);
+        if (Log is LogRun log && sw.Elapsed.TotalSeconds > PauseEventSeconds)
+        {
+            log.Paused(sw.Elapsed.TotalSeconds, work.Label);
+        }
+    }
+
     static void Execute(Work work)
     {
         try
@@ -181,17 +208,22 @@ sealed class Bus : IDisposable
         e.ArgString = args;
         e.ArgBinaryStd = null;
         e.ResultsRequests = "";
-        jobClock.Restart();
         Exception? failure = null;
-        try
+        JsonArray? sets = null;
+        lock (Sgbd.Gate)
         {
-            e.ExecuteJob(job);
+            jobClock.Restart();
+            try
+            {
+                e.ExecuteJob(job);
+                sets = Results.ToJson(e.ResultSets);
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+            jobClock.Stop();
         }
-        catch (Exception ex)
-        {
-            failure = ex;
-        }
-        jobClock.Stop();
 
         if (shuttingDown)
         {
@@ -219,7 +251,7 @@ sealed class Bus : IDisposable
         {
             Link.Ok();
         }
-        return Results.ToJson(e.ResultSets);
+        return sets!;
     }
 
     // Logging sessions trace into their own folder; switching needs a new instance.
@@ -244,21 +276,31 @@ sealed class Bus : IDisposable
         {
             return (RunJob(job, args), null);
         }
-        var exchange = RawExchange(request, gapMs);
+        var exchange = RawExchange(request, gapMs, allowRetry: true);
         byte status = exchange.Response[2];
-        if (status == 0xA1)
+        // Only replies whose status BMW's JOBRESULT table calls OKAY or "data valid" are decoded: some
+        // SGBD jobs report OKAY (with zeros) for a rejected reply, and BUSY makes the SGBD resend.
+        string statusText = catalog.StatusTexts.GetValueOrDefault(status, $"unknown status {status:X2}");
+        if (statusText != "OKAY" && !statusText.Contains("GUELTIG"))
         {
-            // The SGBD answers BUSY by sending the telegram again; report it rather than decode it.
-            throw new FelkodException("ecu_rejected", "JOB_STATUS=BUSY (DS2 status A1)");
+            throw new FelkodException("ecu_rejected", $"JOB_STATUS={statusText} (DS2 status {status:X2})");
+        }
+        // The SGBD does not check reply lengths: a short reply would decode into invented values.
+        string key = Convert.ToHexString(request);
+        if (replyLengths.TryGetValue(key, out int expected) && expected != exchange.Response.Length)
+        {
+            throw new FelkodException("ecu_reply_length",
+                $"reply is {exchange.Response.Length} bytes, earlier replies to this request were {expected}");
         }
         var sets = decoder.Decode(job, args, request, exchange.Response);
         if (sets != null)
         {
+            replyLengths.TryAdd(key, exchange.Response.Length);
             return (sets, exchange);
         }
         if (status != 0xA0)
         {
-            throw new FelkodException("ecu_rejected", $"DS2 status {status:X2}; the SGBD could not decode the reply");
+            throw new FelkodException("ecu_rejected", $"JOB_STATUS={statusText}; the SGBD could not decode the reply");
         }
         // An OK reply the job could not finish on: it really needs more than one telegram.
         decoder.MarkNotNative(job, args);
@@ -266,7 +308,9 @@ sealed class Bus : IDisposable
     }
 
     // One telegram on the wire, native. IsLink failures close the port so the next call reopens it.
-    public Ds2Exchange RawExchange(byte[] request, int gapMs)
+    // allowRetry: resend once after a garbled reply. Never for raw telegrams from ds2.raw, where the
+    // ECU may already have acted on the first one.
+    public Ds2Exchange RawExchange(byte[] request, int gapMs, bool allowRetry)
     {
         if (shuttingDown)
         {
@@ -281,10 +325,12 @@ sealed class Bus : IDisposable
             {
                 exchange = native.Transact(request, gapMs, Ds2FirstByteTimeoutMs, Ds2InterByteTimeoutMs);
             }
-            catch (FelkodException ex) when (ex.Code == Ds2Port.Corrupt)
+            catch (FelkodException ex) when (ex.Code == Ds2Port.Corrupt && allowRetry)
             {
-                // one garbled reply is noise, not a lost link: try once more (input is flushed first)
-                exchange = native.Transact(request, gapMs, Ds2FirstByteTimeoutMs, Ds2InterByteTimeoutMs);
+                // one garbled reply is noise, not a lost link: wait for the line to go quiet, keep the
+                // gap, and try once more
+                native.DrainUntilIdle();
+                exchange = native.Transact(request, gapMs, Ds2FirstByteTimeoutMs, Ds2InterByteTimeoutMs) with { Retries = 1 };
             }
             Link.Ok();
             return exchange;
@@ -315,6 +361,15 @@ sealed class Bus : IDisposable
             return;
         }
         DisposeInstance();
+        lock (Sgbd.Gate)
+        {
+            ediabas = CreateInstance();
+        }
+        needsReset = false;
+    }
+
+    EdiabasNet CreateInstance()
+    {
         var e = new EdiabasNet();
         e.EdInterfaceClass = new EdInterfaceObd { ComPort = config.Port };
         e.SetConfigProperty("EcuPath", config.EcuPath);
@@ -327,8 +382,7 @@ sealed class Bus : IDisposable
         e.NoInitForVJobs = true;
         e.AbortJobFunc = () => shuttingDown || (jobClock.IsRunning && jobClock.Elapsed.TotalSeconds > config.JobTimeoutS);
         e.ResolveSgbdFile(config.Sgbd);
-        ediabas = e;
-        needsReset = false;
+        return e;
     }
 
     void DisposeInstance()
@@ -336,7 +390,10 @@ sealed class Bus : IDisposable
         try
         {
             // Closes EdiabasLib's static serial port and stops its foreground comm thread.
-            ediabas?.Dispose();
+            lock (Sgbd.Gate)
+            {
+                ediabas?.Dispose();
+            }
         }
         catch (Exception)
         {
@@ -394,14 +451,28 @@ sealed class Catalog
 
     public Catalog(Config config)
     {
-        ediabas = new EdiabasNet();
-        ediabas.EdInterfaceClass = new EdInterfaceObd { ComPort = "none" };
-        ediabas.SetConfigProperty("EcuPath", config.EcuPath);
-        ediabas.SetConfigProperty("ApiTrace", "0");
-        ediabas.SetConfigProperty("IfhTrace", "0");
-        ediabas.NoInitForVJobs = true;
-        ediabas.ResolveSgbdFile(config.Sgbd);
+        lock (Sgbd.Gate)
+        {
+            ediabas = new EdiabasNet();
+            ediabas.EdInterfaceClass = new EdInterfaceObd { ComPort = "none" };
+            ediabas.SetConfigProperty("EcuPath", config.EcuPath);
+            ediabas.SetConfigProperty("ApiTrace", "0");
+            ediabas.SetConfigProperty("IfhTrace", "0");
+            ediabas.NoInitForVJobs = true;
+            ediabas.ResolveSgbdFile(config.Sgbd);
+        }
+        foreach (var row in Run("_TABLE", "JOBRESULT").Skip(2))
+        {
+            var cells = row!.AsObject().Select(cell => cell.Value?.ToString()).ToList();
+            if (cells.Count >= 2 && cells[0] is string sb && sb.StartsWith("0x"))
+            {
+                StatusTexts[Convert.ToByte(sb[2..], 16)] = cells[1] ?? "";
+            }
+        }
     }
+
+    // DS2 status byte -> BMW's text for it (the SGBD's JOBRESULT table), e.g. 0xA2 -> ERROR_ECU_REJECTED.
+    public Dictionary<byte, string> StatusTexts { get; } = new();
 
     public string SgbdFile => ediabas.SgbdFileName;
 
@@ -409,11 +480,14 @@ sealed class Catalog
     {
         lock (gate)
         {
-            ediabas.ArgString = args;
-            ediabas.ArgBinaryStd = null;
-            ediabas.ResultsRequests = "";
-            ediabas.ExecuteJob(vjob);
-            return Results.ToJson(ediabas.ResultSets);
+            lock (Sgbd.Gate)
+            {
+                ediabas.ArgString = args;
+                ediabas.ArgBinaryStd = null;
+                ediabas.ResultsRequests = "";
+                ediabas.ExecuteJob(vjob);
+                return Results.ToJson(ediabas.ResultSets);
+            }
         }
     }
 

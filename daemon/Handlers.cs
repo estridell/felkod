@@ -18,7 +18,22 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
 
     readonly DateTime startedAt = DateTime.UtcNow;
 
-    public async Task<JsonNode?> Call(string method, JsonObject p, JsonArray warnings) => method switch
+    public Task<JsonNode?> Call(string method, JsonObject p, JsonArray warnings)
+    {
+        // names the bus work this call queues, for paused events in a running log
+        Bus.RequestLabel.Value = method;
+        return Dispatch(method, p, warnings);
+    }
+
+    // Builds the ds2.raw allowlist (the telegram of every read-only SGBD job) at startup: it takes
+    // about 2 s of SGBD work, which must not happen in the middle of a log.
+    public void WarmUp() => ReadOnlyTelegrams();
+
+    HashSet<string> ReadOnlyTelegrams() => readOnlyTelegrams ??= catalog.JobNames().Where(Results.IsReadOnlyJob)
+        .Select(job => decoder.RequestFor(job)).OfType<byte[]>()
+        .Select(Convert.ToHexString).ToHashSet();
+
+    async Task<JsonNode?> Dispatch(string method, JsonObject p, JsonArray warnings) => method switch
     {
         "status" => Status(),
         "ident" => await Ident(),
@@ -182,8 +197,17 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             Results.EnsureOkay(before);
             var faults = FaultList(before);
             Audit("faults.clear", new JsonObject { ["stage"] = "sending", ["ubatt_v"] = ubatt, ["faults_before"] = faults.DeepClone() });
-            var cleared = bus.RunJob("FS_LOESCHEN");
-            Results.EnsureOkay(cleared);
+            try
+            {
+                var cleared = bus.RunJob("FS_LOESCHEN");
+                Results.EnsureOkay(cleared);
+            }
+            catch (Exception ex)
+            {
+                // the ECU may or may not have cleared; the audit says what is known
+                Audit("faults.clear", new JsonObject { ["stage"] = "failed", ["error"] = ex.Message });
+                throw;
+            }
             Audit("faults.clear", new JsonObject { ["stage"] = "done" });
             return new JsonObject { ["cleared"] = true, ["ubatt_v"] = ubatt, ["faults_before"] = faults };
         });
@@ -376,10 +400,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         }
         if (!allowWrite)
         {
-            readOnlyTelegrams ??= catalog.JobNames().Where(Results.IsReadOnlyJob)
-                .Select(job => decoder.RequestFor(job)).OfType<byte[]>()
-                .Select(Convert.ToHexString).ToHashSet();
-            if (!readOnlyTelegrams.Contains(Convert.ToHexString(request)))
+            if (!ReadOnlyTelegrams().Contains(Convert.ToHexString(request)))
             {
                 throw new FelkodException("write_not_allowed",
                     "not a telegram any read-only SGBD job sends; pass allow_write to send it anyway");
@@ -391,7 +412,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         }
         return await bus.Submit(() =>
         {
-            var exchange = bus.RawExchange(request, gapMs);
+            var exchange = bus.RawExchange(request, gapMs, allowRetry: false);
             return new JsonObject
             {
                 ["request"] = Convert.ToHexString(exchange.Request),

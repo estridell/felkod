@@ -4,7 +4,7 @@ using System.IO.Ports;
 namespace Felkod.Daemon;
 
 // Times in ms from the start of writing the request: echo complete, first reply byte (after the echo), reply complete.
-sealed record Ds2Exchange(byte[] Request, byte[] Response, double EchoMs, double FirstByteMs, double TotalMs, double WaitedMs);
+sealed record Ds2Exchange(byte[] Request, byte[] Response, double EchoMs, double FirstByteMs, double TotalMs, double WaitedMs, int Retries = 0);
 
 // Native DS2 over the K+DCAN cable: 9600 baud 8E1, telegram = address, total length, payload, XOR checksum.
 // The cable echoes every byte sent (single-wire K-line), so the echo is read back and checked first.
@@ -38,8 +38,9 @@ sealed class Ds2Port : IDisposable
         {
             port.Open();
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception ex)
         {
+            port.Dispose();
             throw new FelkodException("link", $"cannot open {path}: {ex.Message}", isLink: true);
         }
     }
@@ -106,11 +107,41 @@ sealed class Ds2Port : IDisposable
             return new Ds2Exchange(request, response, Math.Round(echoMs, 2), Math.Round(firstByteMs, 2),
                 Math.Round(clock.Elapsed.TotalMilliseconds, 2), Math.Round(waitedMs, 2));
         }
-        catch (Exception ex) when (ex is not FelkodException)
+        catch (FelkodException)
+        {
+            // something may have been on the wire: the gap before the next request counts from now
+            lastResponseEnd = Stopwatch.GetTimestamp();
+            throw;
+        }
+        catch (Exception ex)
         {
             // write timeouts, a yanked device, a closed port: all mean the link is gone
             throw new FelkodException("link", $"serial port: {ex.GetType().Name}: {ex.Message}", isLink: true);
         }
+    }
+
+    // Reads and drops bytes until the line has been quiet for quietMs (at most maxMs): the rest of a
+    // garbled reply must not be taken as the start of the next one.
+    public void DrainUntilIdle(int quietMs = 20, int maxMs = 300)
+    {
+        var buffer = new byte[256];
+        var total = Stopwatch.StartNew();
+        var quiet = Stopwatch.StartNew();
+        while (quiet.ElapsedMilliseconds < quietMs && total.ElapsedMilliseconds < maxMs)
+        {
+            try
+            {
+                if (port.Read(buffer, 0, buffer.Length) > 0)
+                {
+                    quiet.Restart();
+                }
+            }
+            catch (TimeoutException)
+            {
+                // nothing arrived within the read timeout
+            }
+        }
+        lastResponseEnd = Stopwatch.GetTimestamp();
     }
 
     // Reads count bytes within timeoutMs; null on timeout.

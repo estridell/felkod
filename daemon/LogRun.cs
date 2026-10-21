@@ -95,6 +95,11 @@ sealed class LogRun
                     lastError = ex.Message;
                 }
                 session.AddEvent(startedAt, startedElapsed, "link_lost", job, $"{ex.Message}; detected at {Elapsed:F3} s");
+                // the interrupted cycle is over; after the outage a new one starts, so no cycle holds a job twice
+                if (position != 0)
+                {
+                    cycle++;
+                }
                 position = 0;
             }
             catch (FelkodException ex) when (ex.Code != "shutting_down")
@@ -120,9 +125,20 @@ sealed class LogRun
             session.AddEvent(DateTime.UtcNow, Elapsed, "still_down", null, $"down {now - downSince:F1} s; last error {lastError}");
         }
         bus.ForceReset();
+        var probeAt = DateTime.UtcNow;
+        double probeElapsed = Elapsed;
         try
         {
-            Sample(bus, jobs[0], cycle, DateTime.UtcNow, Elapsed);
+            Sample(bus, jobs[0], cycle, probeAt, probeElapsed);
+        }
+        catch (FelkodException ex) when (!ex.IsLink && ex.Code != "shutting_down")
+        {
+            // the ECU answered (e.g. rejected the request): the link is back, the job just failed
+            session.AddEvent(probeAt, probeElapsed, "job_error", jobs[0], ex.Message);
+            lock (gate)
+            {
+                jobErrors[jobs[0]] = jobErrors.GetValueOrDefault(jobs[0]) + 1;
+            }
         }
         catch (FelkodException ex)
         {
@@ -170,8 +186,21 @@ sealed class LogRun
     // An unexpected failure inside a step: recorded so the gap it leaves is visible, then a pause.
     public void InternalError(Exception ex)
     {
-        session.AddEvent(DateTime.UtcNow, Elapsed, "internal_error", null, $"{ex.GetType().Name}: {ex.Message}");
         backoffUntil = clock.Elapsed.TotalSeconds + 1;
+        try
+        {
+            session.AddEvent(DateTime.UtcNow, Elapsed, "internal_error", null, $"{ex.GetType().Name}: {ex.Message}");
+        }
+        catch (Exception)
+        {
+            // the session itself is failing (e.g. disk full); stderr already has the error
+        }
+    }
+
+    // Other work held the bus (e.g. a faults read, a bench): no samples were taken meanwhile.
+    public void Paused(double seconds, string what)
+    {
+        session.AddEvent(DateTime.UtcNow, Elapsed, "paused", null, $"{what} held the bus for {seconds:F2} s");
     }
 
     public JsonObject Status()

@@ -22,10 +22,11 @@ sealed class Session : IDisposable
         CREATE INDEX readings_by_name ON readings (name, sample_id);
         -- the telegram exchange behind a natively transported sample (hex, with checksums; times in ms
         -- from the start of writing the request: echo complete, first reply byte after the echo, reply
-        -- complete; waited_ms = gap waited before sending)
+        -- complete; waited_ms = gap waited before sending; retries = resends after a garbled reply)
         CREATE TABLE raw (sample_id INTEGER PRIMARY KEY REFERENCES samples (id), request TEXT NOT NULL,
-                          response TEXT NOT NULL, echo_ms REAL, first_byte_ms REAL, total_ms REAL, waited_ms REAL);
-        -- link_lost, still_down, link_restored, job_error, note
+                          response TEXT NOT NULL, echo_ms REAL, first_byte_ms REAL, total_ms REAL, waited_ms REAL,
+                          retries INTEGER NOT NULL DEFAULT 0);
+        -- link_lost, still_down, link_restored, job_error, not_native, internal_error, paused
         CREATE TABLE events (id INTEGER PRIMARY KEY, t TEXT NOT NULL, elapsed_s REAL NOT NULL,
                              kind TEXT NOT NULL, job TEXT, detail TEXT);
         CREATE VIEW series AS
@@ -85,9 +86,8 @@ sealed class Session : IDisposable
         using var cmd = db.CreateCommand();
         cmd.CommandText = "INSERT INTO meta (key, value) VALUES ($k, $v) ON CONFLICT (key) DO UPDATE SET value = excluded.value";
         cmd.Parameters.AddWithValue("$k", key);
-        object stored = value is JsonValue v && v.TryGetValue<string>(out var s) ? s
-            : value != null ? value.ToJsonString()
-            : DBNull.Value;
+        // every value as JSON text, so "123" (a note) and 123 (a number) stay distinguishable
+        object stored = value != null ? value.ToJsonString() : DBNull.Value;
         cmd.Parameters.AddWithValue("$v", stored);
         cmd.ExecuteNonQuery();
         // write-then-rename, so a reader (felkod sessions) never sees a half-written file
@@ -138,8 +138,8 @@ sealed class Session : IDisposable
         if (exchange != null)
         {
             using var raw = db.CreateCommand();
-            raw.CommandText = "INSERT INTO raw (sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms) "
-                + "VALUES ($id, $rq, $rs, $e, $f, $t, $w)";
+            raw.CommandText = "INSERT INTO raw (sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms, retries) "
+                + "VALUES ($id, $rq, $rs, $e, $f, $t, $w, $r)";
             raw.Parameters.AddWithValue("$id", id);
             raw.Parameters.AddWithValue("$rq", Convert.ToHexString(exchange.Request));
             raw.Parameters.AddWithValue("$rs", Convert.ToHexString(exchange.Response));
@@ -147,6 +147,7 @@ sealed class Session : IDisposable
             raw.Parameters.AddWithValue("$f", exchange.FirstByteMs);
             raw.Parameters.AddWithValue("$t", exchange.TotalMs);
             raw.Parameters.AddWithValue("$w", exchange.WaitedMs);
+            raw.Parameters.AddWithValue("$r", exchange.Retries);
             raw.ExecuteNonQuery();
         }
         tx.Commit();
