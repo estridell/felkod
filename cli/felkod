@@ -335,7 +335,9 @@ def build_parser():
     p.add_argument("job", nargs="?")
     p.set_defaults(func=cmd_jobs)
 
-    p = sub.add_parser("run", help="run one SGBD job; jobs that change the car need --allow-write")
+    p = sub.add_parser("run", help="run one SGBD job; jobs that change the car need --allow-write; the "
+                                   "metadata jobs _JOBS, _JOBCOMMENTS, _ARGUMENTS, _RESULTS, _VERSIONINFO, "
+                                   "_TABLES and _TABLE <name> read the SGBD offline")
     p.add_argument("job")
     p.add_argument("args", nargs="?", help="EDIABAS argument string, e.g. 'arg1;arg2'")
     p.add_argument("--allow-write", action="store_true")

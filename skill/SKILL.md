@@ -29,7 +29,9 @@ positional arguments:
     jobs                list the SGBD's jobs, or describe one (arguments,
                         results, comments)
     run                 run one SGBD job; jobs that change the car need
-                        --allow-write
+                        --allow-write; the metadata jobs _JOBS, _JOBCOMMENTS,
+                        _ARGUMENTS, _RESULTS, _VERSIONINFO, _TABLES and _TABLE
+                        <name> read the SGBD offline
     read                run read-only jobs once, or log them for --duration
                         seconds
     log                 background logging session: start, stop, status
