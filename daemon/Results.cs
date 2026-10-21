@@ -44,6 +44,11 @@ static class Results
     // results left as zeros or garbage; such results must never be treated as data.
     public static void EnsureOkay(JsonArray sets)
     {
+        // set 0 is EDIABAS's own; a job that returned nothing beyond it produced no data to trust
+        if (sets.Count < 2)
+        {
+            throw new FelkodException("no_results", "the job returned no result sets");
+        }
         foreach (var set in sets)
         {
             if (set!["JOB_STATUS"] is JsonNode status && status.GetValue<string>() != "OKAY")

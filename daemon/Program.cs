@@ -26,8 +26,10 @@ var signalHandlers = new[] { PosixSignal.SIGINT, PosixSignal.SIGTERM, PosixSigna
 
 var catalog = new Catalog(config);
 var decoder = new SgbdDecoder(config);
-var bus = new Bus(config, decoder);
-var server = new RpcServer(config.SocketPath, new Handlers(config, bus, catalog, decoder, shutdown.Set));
+var bus = new Bus(config, decoder, catalog);
+var handlers = new Handlers(config, bus, catalog, decoder, shutdown.Set);
+handlers.WarmUp();
+var server = new RpcServer(config.SocketPath, handlers);
 try
 {
     server.Start();
