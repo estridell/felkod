@@ -58,7 +58,7 @@ def start_daemon(extra_args=()):
     if not DAEMON.exists():
         raise Failure("daemon_missing", f"{DAEMON} not found; build it with: dotnet build -c Release {REPO / 'daemon'}")
     extra_args = list(extra_args)
-    # FELKOD_PORT keeps auto-started daemons on a test port (e.g. devtools/fake_ecu.py)
+    # FELKOD_PORT keeps auto-started daemons on a test port (e.g. a fake ECU on a pty)
     if os.environ.get("FELKOD_PORT") and "--port" not in extra_args:
         extra_args += ["--port", os.environ["FELKOD_PORT"]]
     data_dir().mkdir(parents=True, exist_ok=True)
