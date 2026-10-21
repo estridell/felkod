@@ -24,3 +24,6 @@ spike/traces/
 
 # devtools build output
 devtools/build/
+
+# Community definitions without a published licence (devtools/fetch_community.sh)
+vendor/community/
