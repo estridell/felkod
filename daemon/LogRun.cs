@@ -8,7 +8,8 @@ namespace Felkod.Daemon;
 // per successful job. A link failure records link_lost (stamped at the failing job's start), then a
 // fresh EdiabasLib instance is probed about once a second (still_down every 10 s) until a job
 // succeeds (link_restored). Other job failures (e.g. the ECU rejecting a request) record job_error
-// and logging continues after a short back-off.
+// and logging continues after a short back-off. Native logs record not_native the first time a job
+// has to fall back to EdiabasLib, and count those samples.
 sealed class LogRun
 {
     readonly Session session;
@@ -22,6 +23,8 @@ sealed class LogRun
     readonly DateTime startedAt = DateTime.UtcNow;
     readonly Dictionary<string, int> samples = new();
     readonly Dictionary<string, int> jobErrors = new();
+    // native logging: samples a job had to take through EdiabasLib instead
+    readonly Dictionary<string, int> fallbacks = new();
     readonly JsonArray outages = new();
     readonly object gate = new();
     int cycle;
@@ -67,6 +70,7 @@ sealed class LogRun
         {
             var cycleJobs = CycleJobs();
             string job = cycleJobs[position];
+            int sampleCycle = cycle;
             if (++position >= cycleJobs.Length)
             {
                 position = 0;
@@ -76,7 +80,7 @@ sealed class LogRun
             double startedElapsed = Elapsed;
             try
             {
-                Sample(bus, job, startedAt, startedElapsed);
+                Sample(bus, job, sampleCycle, startedAt, startedElapsed);
             }
             catch (FelkodException ex) when (ex.Code == "shutting_down")
             {
@@ -118,7 +122,7 @@ sealed class LogRun
         bus.ForceReset();
         try
         {
-            Sample(bus, jobs[0], DateTime.UtcNow, Elapsed);
+            Sample(bus, jobs[0], cycle, DateTime.UtcNow, Elapsed);
         }
         catch (FelkodException ex)
         {
@@ -140,16 +144,34 @@ sealed class LogRun
         return true;
     }
 
-    void Sample(Bus bus, string job, DateTime startedAt, double startedElapsed)
+    void Sample(Bus bus, string job, int sampleCycle, DateTime startedAt, double startedElapsed)
     {
         var sw = Stopwatch.StartNew();
         var (sets, exchange) = nativeGapMs is int gap ? bus.RunJobNative(job, "", gap) : (bus.RunJob(job), null);
         Results.EnsureOkay(sets);
-        session.AddSample(startedAt, startedElapsed, cycle, job, Math.Round(sw.Elapsed.TotalMilliseconds, 1), sets, exchange);
+        session.AddSample(startedAt, startedElapsed, sampleCycle, job, Math.Round(sw.Elapsed.TotalMilliseconds, 1), sets, exchange);
+        bool firstFallback = false;
         lock (gate)
         {
             samples[job] = samples.GetValueOrDefault(job) + 1;
+            if (nativeGapMs != null && exchange == null)
+            {
+                fallbacks[job] = fallbacks.GetValueOrDefault(job) + 1;
+                firstFallback = fallbacks[job] == 1;
+            }
         }
+        if (firstFallback)
+        {
+            session.AddEvent(startedAt, startedElapsed, "not_native", job,
+                "the job needs more than one telegram; its samples are taken through EdiabasLib");
+        }
+    }
+
+    // An unexpected failure inside a step: recorded so the gap it leaves is visible, then a pause.
+    public void InternalError(Exception ex)
+    {
+        session.AddEvent(DateTime.UtcNow, Elapsed, "internal_error", null, $"{ex.GetType().Name}: {ex.Message}");
+        backoffUntil = clock.Elapsed.TotalSeconds + 1;
     }
 
     public JsonObject Status()
@@ -165,6 +187,11 @@ sealed class LogRun
             foreach (var (job, n) in jobErrors)
             {
                 perJobErrors[job] = n;
+            }
+            var perJobFallbacks = new JsonObject();
+            foreach (var (job, n) in fallbacks)
+            {
+                perJobFallbacks[job] = n;
             }
             var currentOutages = (JsonArray)outages.DeepClone();
             if (!linkUp)
@@ -189,6 +216,7 @@ sealed class LogRun
                 ["link_up"] = linkUp,
                 ["samples"] = perJob,
                 ["job_errors"] = perJobErrors,
+                ["native_fallbacks"] = perJobFallbacks,
                 ["outages"] = currentOutages,
             };
         }
