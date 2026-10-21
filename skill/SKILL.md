@@ -229,10 +229,11 @@ usage: felkod session [-h] [--limit LIMIT] {show,query} id [sql]
 Session database (SQLite, read-only here): samples(id, t, elapsed_s, cycle,
 job, ms); readings(sample_id, set_index, name, value, text, unit); events(id,
 t, elapsed_s, kind, job, detail); meta(key, value); raw(sample_id, request,
-response, echo_ms, first_byte_ms, total_ms, waited_ms) for native samples;
-view series(t, elapsed_s, job, set_index, name, value, text, unit). t is UTC
-ISO 8601 at job start; names are the SGBD's result names; events.kind is
-link_lost, still_down, link_restored, job_error, not_native or internal_error
+response, echo_ms, first_byte_ms, total_ms, waited_ms, retries) for native
+samples; view series(t, elapsed_s, job, set_index, name, value, text, unit). t
+is UTC ISO 8601 at job start; names are the SGBD's result names; events.kind
+is link_lost, still_down, link_restored, job_error, not_native, internal_error
+or paused; meta values are JSON text
 
 positional arguments:
   {show,query}

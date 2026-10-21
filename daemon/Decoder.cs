@@ -138,12 +138,15 @@ sealed class SgbdDecoder
 
     public SgbdDecoder(Config config)
     {
-        ediabas = new EdiabasNet();
-        ediabas.EdInterfaceClass = decode;
-        ediabas.SetConfigProperty("EcuPath", config.EcuPath);
-        ediabas.SetConfigProperty("ApiTrace", "0");
-        ediabas.SetConfigProperty("IfhTrace", "0");
-        ediabas.ResolveSgbdFile(config.Sgbd);
+        lock (Sgbd.Gate)
+        {
+            ediabas = new EdiabasNet();
+            ediabas.EdInterfaceClass = decode;
+            ediabas.SetConfigProperty("EcuPath", config.EcuPath);
+            ediabas.SetConfigProperty("ApiTrace", "0");
+            ediabas.SetConfigProperty("IfhTrace", "0");
+            ediabas.ResolveSgbdFile(config.Sgbd);
+        }
     }
 
     // The telegram a job sends, or null if it sends none or more than one (not usable natively).
@@ -163,7 +166,10 @@ sealed class SgbdDecoder
             return known;
         }
         decode.Capture();
-        Execute(job, args);
+        lock (Sgbd.Gate)
+        {
+            Execute(job, args);
+        }
         byte[]? request = decode.Captured.Count == 1 ? decode.Captured[0] : null;
         requests[key] = request;
         return request;
@@ -184,8 +190,11 @@ sealed class SgbdDecoder
         lock (gate)
         {
             decode.Answer(request, response);
-            bool ok = Execute(job, args);
-            return ok && decode.Problem == null ? Results.ToJson(ediabas.ResultSets) : null;
+            lock (Sgbd.Gate)
+            {
+                bool ok = Execute(job, args);
+                return ok && decode.Problem == null ? Results.ToJson(ediabas.ResultSets) : null;
+            }
         }
     }
 
