@@ -51,12 +51,17 @@ static class Results
         }
         foreach (var set in sets)
         {
-            if (set!["JOB_STATUS"] is JsonNode status && status.GetValue<string>() != "OKAY")
+            if (set!["JOB_STATUS"] is JsonNode status && !IsOkStatus(status.GetValue<string>()))
             {
                 throw new FelkodException("ecu_rejected", $"JOB_STATUS={status.GetValue<string>()}");
             }
         }
     }
+
+    // OKAY, or BMW's "function ended; data valid" (FUNCTION BEENDET; DATEN GUELTIG) for system checks;
+    // not "...UNGUELTIG" (invalid).
+    public static bool IsOkStatus(string text) =>
+        text == "OKAY" || (text.Contains("GUELTIG") && !text.Contains("UNGUELTIG"));
 
     // Job results without set 0, each split into values and units. The SGBD pairs a value result
     // NAME_WERT with its unit NAME_EINH; units are moved out so every value stays a plain scalar.

@@ -155,8 +155,13 @@ sealed class LogRun
             outages.Add(new JsonObject { ["at_s"] = Math.Round(downSince, 1), ["down_s"] = downFor });
         }
         session.AddEvent(DateTime.UtcNow, Elapsed, "link_restored", null, $"down {downFor} s");
-        // the probe ran jobs[0]; continue the cycle after it
-        position = jobs.Length > 1 ? 1 : 0;
+        // the probe ran jobs[0] as the first job of the current cycle; advance exactly as a sample would
+        position = 1;
+        if (position >= CycleJobs().Length)
+        {
+            position = 0;
+            cycle++;
+        }
         return true;
     }
 
@@ -165,6 +170,12 @@ sealed class LogRun
         var sw = Stopwatch.StartNew();
         var (sets, exchange) = nativeGapMs is int gap ? bus.RunJobNative(job, "", gap) : (bus.RunJob(job), null);
         Results.EnsureOkay(sets);
+        if (exchange != null)
+        {
+            // native: stamp the moment the request went out, after the gap wait
+            startedAt = startedAt.AddMilliseconds(exchange.WaitedMs);
+            startedElapsed = Math.Round(startedElapsed + exchange.WaitedMs / 1000, 3);
+        }
         session.AddSample(startedAt, startedElapsed, sampleCycle, job, Math.Round(sw.Elapsed.TotalMilliseconds, 1), sets, exchange);
         bool firstFallback = false;
         lock (gate)
@@ -200,7 +211,9 @@ sealed class LogRun
     // Other work held the bus (e.g. a faults read, a bench): no samples were taken meanwhile.
     public void Paused(double seconds, string what)
     {
-        session.AddEvent(DateTime.UtcNow, Elapsed, "paused", null, $"{what} held the bus for {seconds:F2} s");
+        // stamped when the pause began
+        session.AddEvent(DateTime.UtcNow.AddSeconds(-seconds), Math.Round(Elapsed - seconds, 3), "paused", null,
+            $"{what} held the bus for {seconds:F2} s");
     }
 
     public JsonObject Status()
