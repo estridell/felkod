@@ -1,0 +1,4 @@
+[submodule "vendor/ediabaslib"]
+	path = vendor/ediabaslib
+	url = https://github.com/uholeschak/ediabaslib.git
+	shallow = true
