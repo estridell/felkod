@@ -16,6 +16,8 @@ sealed class LogRun
     readonly string[] slowJobs;
     readonly int slowEvery;
     readonly double durationS;
+    // Native DS2 transport (SGBD-decoded) with this gap before each request, or EdiabasLib jobs when null.
+    readonly int? nativeGapMs;
     readonly Stopwatch clock = Stopwatch.StartNew();
     readonly DateTime startedAt = DateTime.UtcNow;
     readonly Dictionary<string, int> samples = new();
@@ -36,8 +38,9 @@ sealed class LogRun
     public string Dir => session.Dir;
     public bool Finished => stopRequested || (durationS > 0 && clock.Elapsed.TotalSeconds >= durationS);
 
-    public LogRun(Session session, string[] jobs, string[] slowJobs, int slowEvery, double durationS)
+    public LogRun(Session session, string[] jobs, string[] slowJobs, int slowEvery, double durationS, int? nativeGapMs)
     {
+        this.nativeGapMs = nativeGapMs;
         this.session = session;
         this.jobs = jobs;
         this.slowJobs = slowJobs;
@@ -140,9 +143,9 @@ sealed class LogRun
     void Sample(Bus bus, string job, DateTime startedAt, double startedElapsed)
     {
         var sw = Stopwatch.StartNew();
-        var sets = bus.RunJob(job);
+        var (sets, exchange) = nativeGapMs is int gap ? bus.RunJobNative(job, "", gap) : (bus.RunJob(job), null);
         Results.EnsureOkay(sets);
-        session.AddSample(startedAt, startedElapsed, cycle, job, Math.Round(sw.Elapsed.TotalMilliseconds, 1), sets);
+        session.AddSample(startedAt, startedElapsed, cycle, job, Math.Round(sw.Elapsed.TotalMilliseconds, 1), sets, exchange);
         lock (gate)
         {
             samples[job] = samples.GetValueOrDefault(job) + 1;

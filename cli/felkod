@@ -104,8 +104,12 @@ def data(method, params=None):
 
 
 WARNINGS = []
+NATIVE_HELP = ("felkodd's own DS2 transport for jobs that send one telegram, decoded by the SGBD; "
+               "the raw telegrams are stored in the session's raw table")
+GAP_HELP = "native: ms between a reply and the next request (default 100, BMW's regeneration time for MS43)"
 SESSION_TABLES = ("samples(id, t, elapsed_s, cycle, job, ms); readings(sample_id, name, value, text, unit); "
                   "events(id, t, elapsed_s, kind, job, detail); meta(key, value); "
+                  "raw(sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms) for native samples; "
                   "view series(t, elapsed_s, job, name, value, text, unit). t is UTC ISO 8601 at job start; "
                   "names are the SGBD's result names; events.kind is link_lost, still_down, link_restored or job_error")
 
@@ -166,11 +170,19 @@ def cmd_run(args):
     return data("job.run", {"job": args.job, "args": args.args or "", "allow_write": args.allow_write})
 
 
+def native_params(args):
+    params = {"native": args.native}
+    if args.gap_ms is not None:
+        params["gap_ms"] = args.gap_ms
+    return params
+
+
 def cmd_read(args):
     if args.duration is None:
         return {"results": [data("job.run", {"job": job}) for job in args.jobs]}
     started = data("log.start", {"jobs": args.jobs, "slow_jobs": jobs_arg(args.slow_jobs),
-                                 "slow_every": args.slow_every, "duration_s": args.duration, "note": args.note})
+                                 "slow_every": args.slow_every, "duration_s": args.duration, "note": args.note,
+                                 **native_params(args)})
     session_id = started["session_id"]
     time.sleep(args.duration)
     while (status := data("log.status")).get("session_id") == session_id:
@@ -183,10 +195,28 @@ def cmd_log(args):
         if not args.jobs:
             raise Failure("bad_request", "log start needs --jobs")
         return data("log.start", {"jobs": jobs_arg(args.jobs), "slow_jobs": jobs_arg(args.slow_jobs),
-                                  "slow_every": args.slow_every, "duration_s": args.duration or 0, "note": args.note})
+                                  "slow_every": args.slow_every, "duration_s": args.duration or 0, "note": args.note,
+                                  **native_params(args)})
     if args.action == "stop":
         return data("log.stop")
     return data("log.status")
+
+
+def cmd_bench(args):
+    return data("bench", {"job": args.job, "n": args.n, **native_params(args)})
+
+
+def cmd_ds2(args):
+    if args.action == "request":
+        return data("ds2.request", {"job": args.value, "args": args.args or ""})
+    if args.action == "decode":
+        if not args.response:
+            raise Failure("bad_request", "ds2 decode needs --response HEX")
+        return data("ds2.decode", {"job": args.value, "args": args.args or "", "response": args.response})
+    params = {"request": args.value, "allow_write": args.allow_write}
+    if args.gap_ms is not None:
+        params["gap_ms"] = args.gap_ms
+    return data("ds2.raw", params)
 
 
 def cmd_sessions(args):
@@ -275,6 +305,8 @@ def build_parser():
     p.add_argument("--slow-jobs", help="comma list, run every --slow-every cycles")
     p.add_argument("--slow-every", type=int, default=10)
     p.add_argument("--note")
+    p.add_argument("--native", action="store_true", help=NATIVE_HELP)
+    p.add_argument("--gap-ms", type=int, help=GAP_HELP)
     p.set_defaults(func=cmd_read)
 
     p = sub.add_parser("log", help="background logging session: start, stop, status")
@@ -284,7 +316,27 @@ def build_parser():
     p.add_argument("--slow-every", type=int, default=10)
     p.add_argument("--duration", type=float, help="seconds; default runs until log stop")
     p.add_argument("--note")
+    p.add_argument("--native", action="store_true", help=NATIVE_HELP)
+    p.add_argument("--gap-ms", type=int, help=GAP_HELP)
     p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("bench", help="time a read-only job; --native also reports the ECU's reply latency")
+    p.add_argument("job")
+    p.add_argument("-n", type=int, default=20)
+    p.add_argument("--native", action="store_true", help=NATIVE_HELP)
+    p.add_argument("--gap-ms", type=int, help=GAP_HELP)
+    p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("ds2", help="DS2 telegrams: request (what a job sends), decode (a reply via the SGBD), "
+                                   "raw (send one telegram)")
+    p.add_argument("action", choices=["request", "decode", "raw"])
+    p.add_argument("value", help="job name (request, decode) or telegram hex (raw; checksum optional)")
+    p.add_argument("--args", help="EDIABAS argument string for the job")
+    p.add_argument("--response", help="reply hex for decode, as stored in a session's raw table")
+    p.add_argument("--gap-ms", type=int, help=GAP_HELP)
+    p.add_argument("--allow-write", action="store_true",
+                   help="raw: send a telegram that no read-only SGBD job sends")
+    p.set_defaults(func=cmd_ds2)
 
     sub.add_parser("sessions", help="list logging sessions").set_defaults(func=cmd_sessions)
 
