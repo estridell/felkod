@@ -35,21 +35,10 @@ sealed class DecodeInterface : EdInterfaceBase
         Problem = null;
     }
 
-    // The SGBD hands over the telegram without its checksum (EdiabasLib's DS2 transport adds it)
-    // unless the job computes it itself; normalise to the full telegram as it goes on the wire.
-    static byte[] WithChecksum(byte[] sendData)
-    {
-        if (sendData.Length >= 2 && sendData.Length == sendData[1] - 1)
-        {
-            return [.. sendData, Ds2Port.Checksum(sendData)];
-        }
-        return sendData;
-    }
-
     public override bool TransmitData(byte[] sendData, out byte[] receiveData)
     {
         receiveData = [];
-        var request = WithChecksum(sendData);
+        var request = Ds2Port.FullTelegram(sendData);
         if (capturing)
         {
             Captured.Add(request);

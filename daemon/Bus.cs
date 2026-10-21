@@ -69,8 +69,7 @@ sealed class Bus : IDisposable
     readonly Config config;
     readonly SgbdDecoder decoder;
     readonly Catalog catalog;
-    // native: the length of the first OK reply per request; a different length later is not trusted
-    readonly Dictionary<string, int> replyLengths = new();
+    readonly ReplyGuard guard;
     readonly BlockingCollection<Work> queue = new();
     readonly Thread worker;
     readonly Stopwatch jobClock = new();
@@ -89,6 +88,7 @@ sealed class Bus : IDisposable
         this.config = config;
         this.decoder = decoder;
         this.catalog = catalog;
+        guard = new ReplyGuard(catalog);
         traceDir = config.TraceDir;
         Directory.CreateDirectory(traceDir);
         worker = new Thread(Loop) { Name = "felkod-bus", IsBackground = true };
@@ -210,6 +210,8 @@ sealed class Bus : IDisposable
         e.ResultsRequests = "";
         Exception? failure = null;
         JsonArray? sets = null;
+        var observed = (ObservedObd)e.EdInterfaceClass;
+        observed.Exchanges.Clear();
         lock (Sgbd.Gate)
         {
             jobClock.Restart();
@@ -251,6 +253,12 @@ sealed class Bus : IDisposable
         {
             Link.Ok();
         }
+        if (observed.Exchanges.Count == 1)
+        {
+            var (request, response) = observed.Exchanges[0];
+            guard.Check(request, response);
+            guard.Learn(request, response);
+        }
         return sets!;
     }
 
@@ -277,30 +285,18 @@ sealed class Bus : IDisposable
             return (RunJob(job, args), null);
         }
         var exchange = RawExchange(request, gapMs, allowRetry: true);
-        byte status = exchange.Response[2];
-        // Only replies whose status BMW's JOBRESULT table calls OKAY or "data valid" are decoded: some
-        // SGBD jobs report OKAY (with zeros) for a rejected reply, and BUSY makes the SGBD resend.
-        string statusText = catalog.StatusTexts.GetValueOrDefault(status, $"unknown status {status:X2}");
-        if (statusText != "OKAY" && !statusText.Contains("GUELTIG"))
-        {
-            throw new FelkodException("ecu_rejected", $"JOB_STATUS={statusText} (DS2 status {status:X2})");
-        }
-        // The SGBD does not check reply lengths: a short reply would decode into invented values.
-        string key = Convert.ToHexString(request);
-        if (replyLengths.TryGetValue(key, out int expected) && expected != exchange.Response.Length)
-        {
-            throw new FelkodException("ecu_reply_length",
-                $"reply is {exchange.Response.Length} bytes, earlier replies to this request were {expected}");
-        }
+        // status (BUSY would make the SGBD resend) and length are checked before decoding
+        guard.Check(request, exchange.Response);
         var sets = decoder.Decode(job, args, request, exchange.Response);
         if (sets != null)
         {
-            replyLengths.TryAdd(key, exchange.Response.Length);
+            guard.Learn(request, exchange.Response);
             return (sets, exchange);
         }
-        if (status != 0xA0)
+        if (exchange.Response[2] != 0xA0)
         {
-            throw new FelkodException("ecu_rejected", $"JOB_STATUS={statusText}; the SGBD could not decode the reply");
+            throw new FelkodException("ecu_rejected",
+                $"JOB_STATUS={catalog.StatusText(exchange.Response[2])}; the SGBD could not decode the reply");
         }
         // An OK reply the job could not finish on: it really needs more than one telegram.
         decoder.MarkNotNative(job, args);
@@ -371,7 +367,7 @@ sealed class Bus : IDisposable
     EdiabasNet CreateInstance()
     {
         var e = new EdiabasNet();
-        e.EdInterfaceClass = new EdInterfaceObd { ComPort = config.Port };
+        e.EdInterfaceClass = new ObservedObd { ComPort = config.Port };
         e.SetConfigProperty("EcuPath", config.EcuPath);
         e.SetConfigProperty("TracePath", traceDir);
         e.SetConfigProperty("AppendTrace", "1");
@@ -425,8 +421,10 @@ sealed class Bus : IDisposable
     JsonObject FinishLog()
     {
         var run = Log!;
-        Log = null;
+        // finish first: a status call meanwhile still finds the run, and a session's meta has its
+        // summary by the time it stops being "running"
         var summary = run.Finish();
+        Log = null;
         SetTraceDir(config.TraceDir);
         return summary;
     }
@@ -461,15 +459,26 @@ sealed class Catalog
             ediabas.NoInitForVJobs = true;
             ediabas.ResolveSgbdFile(config.Sgbd);
         }
-        foreach (var row in Run("_TABLE", "JOBRESULT").Skip(2))
+        try
         {
-            var cells = row!.AsObject().Select(cell => cell.Value?.ToString()).ToList();
-            if (cells.Count >= 2 && cells[0] is string sb && sb.StartsWith("0x"))
+            foreach (var row in Run("_TABLE", "JOBRESULT").Skip(2))
             {
-                StatusTexts[Convert.ToByte(sb[2..], 16)] = cells[1] ?? "";
+                var cells = row!.AsObject().Select(cell => cell.Value?.ToString()).ToList();
+                if (cells.Count >= 2 && cells[0] is string sb && sb.StartsWith("0x"))
+                {
+                    StatusTexts[Convert.ToByte(sb[2..], 16)] = cells[1] ?? "";
+                }
             }
         }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            Console.Error.WriteLine($"felkodd: no usable JOBRESULT table in {SgbdFile}: {ex.Message}");
+        }
     }
+
+    // BMW's text for a DS2 status byte; without a JOBRESULT table only 0xA0 counts as OKAY.
+    public string StatusText(byte status) =>
+        StatusTexts.TryGetValue(status, out var text) ? text : status == 0xA0 && StatusTexts.Count == 0 ? "OKAY" : $"unknown status {status:X2}";
 
     // DS2 status byte -> BMW's text for it (the SGBD's JOBRESULT table), e.g. 0xA2 -> ERROR_ECU_REJECTED.
     public Dictionary<byte, string> StatusTexts { get; } = new();

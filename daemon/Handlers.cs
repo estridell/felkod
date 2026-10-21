@@ -61,7 +61,11 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
 
     static bool OptBool(JsonObject p, string key) => p[key]?.GetValue<bool>() ?? false;
 
-    static int Gap(JsonObject p) => p["gap_ms"]?.GetValue<int>() ?? DefaultGapMs;
+    static int Gap(JsonObject p)
+    {
+        int gap = p["gap_ms"]?.GetValue<int>() ?? DefaultGapMs;
+        return gap is >= 0 and <= 5000 ? gap : throw new FelkodException("bad_request", "gap_ms must be 0-5000");
+    }
 
     static byte[] Hex(string text)
     {
@@ -219,6 +223,10 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         var slowJobs = StrList(p, "slow_jobs");
         int slowEvery = p["slow_every"]?.GetValue<int>() ?? 10;
         double durationS = p["duration_s"]?.GetValue<double>() ?? 0;
+        if (durationS < 0)
+        {
+            throw new FelkodException("bad_request", "duration_s must be >= 0 (0 = until log.stop)");
+        }
         if (jobs.Length == 0)
         {
             throw new FelkodException("bad_request", "jobs is empty");
@@ -332,8 +340,19 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
                     errors.Add(new JsonObject { ["run"] = i, ["code"] = ex.Code, ["error"] = ex.Message });
                     linkFailuresInARow = ex.IsLink ? linkFailuresInARow + 1 : 0;
                 }
+                catch (Exception ex) when (ex is not FelkodException)
+                {
+                    errors.Add(new JsonObject { ["run"] = i, ["code"] = "internal", ["error"] = $"{ex.GetType().Name}: {ex.Message}" });
+                    linkFailuresInARow = 0;
+                }
             }
             double seconds = clock.Elapsed.TotalSeconds;
+            if (totals.Count == 0)
+            {
+                throw new FelkodException("bench_failed", errors.Count > 0
+                    ? $"all {errors.Count} runs failed; first: {errors[0]!["error"]}"
+                    : $"no runs completed ({aborted ?? "stopped"})");
+            }
             return new JsonObject
             {
                 ["job"] = job,
@@ -381,8 +400,22 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         catalog.RequireJobs([job]);
         var request = decoder.RequestFor(job, args)
             ?? throw new FelkodException("not_native", $"{job} does not send exactly one telegram");
-        var sets = decoder.Decode(job, args, request, Hex(responseHex))
+        var response = Hex(responseHex);
+        // the same checks a live reply gets: framing, then BMW's status text, then the job's own status
+        if (response.Length < 4 || response[1] != response.Length || response[0] != request[0]
+            || Ds2Port.Checksum(response.AsSpan(0, response.Length - 1)) != response[^1])
+        {
+            throw new FelkodException("bad_request",
+                $"not a complete DS2 reply from address {request[0]:X2} (length byte, checksum and address must match)");
+        }
+        string status = catalog.StatusText(response[2]);
+        if (!Results.IsOkStatus(status))
+        {
+            throw new FelkodException("ecu_rejected", $"JOB_STATUS={status} (DS2 status {response[2]:X2})");
+        }
+        var sets = decoder.Decode(job, args, request, response)
             ?? throw new FelkodException("decode_failed", $"{job} could not decode that reply");
+        Results.EnsureOkay(sets);
         return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(sets) };
     }
 
