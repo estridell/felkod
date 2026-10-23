@@ -99,13 +99,17 @@ sealed class Bus : IDisposable
     public Task<JsonNode?> Submit(Func<JsonNode?> run)
     {
         var done = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (shuttingDown)
+        // with Stop's lock: work is either refused here or queued before the worker's final drain
+        lock (queue)
         {
-            done.SetException(new FelkodException("shutting_down", "felkodd is shutting down"));
-        }
-        else
-        {
-            queue.Add(new Work(run, done, RequestLabel.Value ?? "request"));
+            if (shuttingDown)
+            {
+                done.SetException(new FelkodException("shutting_down", "felkodd is shutting down"));
+            }
+            else
+            {
+                queue.Add(new Work(run, done, RequestLabel.Value ?? "request"));
+            }
         }
         return done.Task;
     }
@@ -183,7 +187,16 @@ sealed class Bus : IDisposable
         Execute(work);
         if (Log is LogRun log && sw.Elapsed.TotalSeconds > PauseEventSeconds)
         {
-            log.Paused(sw.Elapsed.TotalSeconds, work.Label);
+            try
+            {
+                log.Paused(sw.Elapsed.TotalSeconds, work.Label);
+            }
+            catch (Exception ex)
+            {
+                // e.g. the disk is full: the bus thread must keep running
+                Console.Error.WriteLine($"felkodd: recording a pause failed: {ex}");
+                log.InternalError(ex);
+            }
         }
     }
 
@@ -212,7 +225,7 @@ sealed class Bus : IDisposable
         JsonArray? sets = null;
         var observed = (ObservedObd)e.EdInterfaceClass;
         observed.Exchanges.Clear();
-        lock (Sgbd.Gate)
+        Sgbd.Use(e, () =>
         {
             jobClock.Restart();
             try
@@ -225,7 +238,7 @@ sealed class Bus : IDisposable
                 failure = ex;
             }
             jobClock.Stop();
-        }
+        });
 
         if (shuttingDown)
         {
@@ -257,6 +270,8 @@ sealed class Bus : IDisposable
         {
             var (request, response) = observed.Exchanges[0];
             guard.Check(request, response);
+            // only a reply the job accepted sets the expected length
+            Results.EnsureOkay(sets!);
             guard.Learn(request, response);
         }
         return sets!;
@@ -290,6 +305,7 @@ sealed class Bus : IDisposable
         var sets = decoder.Decode(job, args, request, exchange.Response);
         if (sets != null)
         {
+            Results.EnsureOkay(sets);
             guard.Learn(request, exchange.Response);
             return (sets, exchange);
         }
@@ -386,9 +402,9 @@ sealed class Bus : IDisposable
         try
         {
             // Closes EdiabasLib's static serial port and stops its foreground comm thread.
-            lock (Sgbd.Gate)
+            if (ediabas != null)
             {
-                ediabas?.Dispose();
+                Sgbd.Use(ediabas, ediabas.Dispose);
             }
         }
         catch (Exception)
@@ -423,15 +439,24 @@ sealed class Bus : IDisposable
         var run = Log!;
         // finish first: a status call meanwhile still finds the run, and a session's meta has its
         // summary by the time it stops being "running"
-        var summary = run.Finish();
-        Log = null;
-        SetTraceDir(config.TraceDir);
-        return summary;
+        try
+        {
+            return run.Finish();
+        }
+        finally
+        {
+            // also when finishing failed: the loop must not retry it forever
+            Log = null;
+            SetTraceDir(config.TraceDir);
+        }
     }
 
     public void Stop()
     {
-        shuttingDown = true;
+        lock (queue)
+        {
+            shuttingDown = true;
+        }
         worker.Join(TimeSpan.FromSeconds(config.JobTimeoutS + 5));
     }
 
@@ -489,14 +514,14 @@ sealed class Catalog
     {
         lock (gate)
         {
-            lock (Sgbd.Gate)
+            return Sgbd.Use(ediabas, () =>
             {
                 ediabas.ArgString = args;
                 ediabas.ArgBinaryStd = null;
                 ediabas.ResultsRequests = "";
                 ediabas.ExecuteJob(vjob);
                 return Results.ToJson(ediabas.ResultSets);
-            }
+            });
         }
     }
 

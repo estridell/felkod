@@ -55,7 +55,12 @@ sealed record Config(string Port, string EcuPath, string Sgbd, string DataDir, s
             }
             opts[key] = args[++i];
         }
-        return new Config(opts["port"], opts["ecu-path"], opts["sgbd"], opts["data-dir"], opts["socket"],
-            double.Parse(opts["job-timeout"], CultureInfo.InvariantCulture));
+        if (!double.TryParse(opts["job-timeout"], CultureInfo.InvariantCulture, out double jobTimeoutS)
+            || !double.IsFinite(jobTimeoutS) || jobTimeoutS <= 0)
+        {
+            Console.Error.WriteLine($"felkodd: --job-timeout must be a number of seconds > 0: {opts["job-timeout"]}");
+            return null;
+        }
+        return new Config(opts["port"], opts["ecu-path"], opts["sgbd"], opts["data-dir"], opts["socket"], jobTimeoutS);
     }
 }

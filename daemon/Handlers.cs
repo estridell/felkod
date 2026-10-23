@@ -39,7 +39,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         "ident" => await Ident(),
         "jobs.list" => JobsList(),
         "jobs.describe" => JobsDescribe(Str(p, "job")),
-        "job.run" => await JobRun(Str(p, "job"), OptStr(p, "args") ?? "", OptBool(p, "allow_write")),
+        "job.run" => await JobRun(Str(p, "job"), OptStr(p, "args") ?? "", OptBool(p, "allow_write"), OptBool(p, "native"), Gap(p)),
         "faults.read" => await FaultsRead(),
         "faults.clear" => await FaultsClear(OptBool(p, "confirm")),
         "log.start" => await LogStart(p, warnings),
@@ -141,15 +141,9 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         };
     }
 
-    // EDIABAS's built-in metadata jobs: they read the SGBD file itself and never talk to the ECU.
-    static readonly HashSet<string> VirtualJobs = new(StringComparer.OrdinalIgnoreCase)
+    async Task<JsonNode?> JobRun(string job, string args, bool allowWrite, bool native, int gapMs)
     {
-        "_JOBS", "_JOBCOMMENTS", "_ARGUMENTS", "_RESULTS", "_VERSIONINFO", "_TABLES", "_TABLE",
-    };
-
-    async Task<JsonNode?> JobRun(string job, string args, bool allowWrite)
-    {
-        if (VirtualJobs.Contains(job))
+        if (JobRules.IsMetadataJob(job))
         {
             // offline, from the catalog: no bus, no ECU, works without the car
             var metadata = catalog.Run(job.ToUpperInvariant(), args);
@@ -162,9 +156,14 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         }
         if (!JobRules.IsReadOnlyJob(job))
         {
+            // native resends a request after a garbled reply, which a job that changes the car must not get
+            if (native)
+            {
+                throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; native only runs read-only jobs");
+            }
             Audit("job.run", new JsonObject { ["job"] = job, ["args"] = args });
         }
-        var sets = (JsonArray)(await bus.Submit(() => bus.RunJob(job, args)))!;
+        var sets = (JsonArray)(await bus.Submit(() => native ? bus.RunJobNative(job, args, gapMs).Sets : bus.RunJob(job, args)))!;
         Results.EnsureOkay(sets);
         return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(sets) };
     }
@@ -235,9 +234,14 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         var slowJobs = StrList(p, "slow_jobs");
         int slowEvery = p["slow_every"]?.GetValue<int>() ?? 10;
         double durationS = p["duration_s"]?.GetValue<double>() ?? 0;
-        if (durationS < 0)
+        // JSON's 1e400 reads as infinity, which meta.json could not store
+        if (!double.IsFinite(durationS) || durationS < 0)
         {
-            throw new FelkodException("bad_request", "duration_s must be >= 0 (0 = until log.stop)");
+            throw new FelkodException("bad_request", "duration_s must be a finite number >= 0 (0 = until log.stop)");
+        }
+        if (slowEvery < 1)
+        {
+            throw new FelkodException("bad_request", "slow_every must be >= 1");
         }
         if (jobs.Length == 0)
         {
@@ -275,27 +279,28 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
                 warnings.Add($"not single-telegram jobs, logged through EdiabasLib: {string.Join(", ", notNative)}");
             }
         }
-        var session = Session.Create(config.SessionsDir, meta);
-        var run = new LogRun(session, jobs, slowJobs, slowEvery, durationS, nativeGapMs);
-        try
+        // Created on the bus thread: two concurrent starts must not pick the same session directory,
+        // and the one refused by StartLog must not delete the other's.
+        var started = await bus.Submit(() =>
         {
-            await bus.Submit(() =>
+            var session = Session.Create(config.SessionsDir, meta);
+            try
             {
-                bus.StartLog(run);
-                return null;
-            });
-        }
-        catch (Exception)
-        {
-            session.Dispose();
-            Directory.Delete(session.Dir, recursive: true);
-            throw;
-        }
+                bus.StartLog(new LogRun(session, jobs, slowJobs, slowEvery, durationS, nativeGapMs));
+            }
+            catch (Exception)
+            {
+                session.Dispose();
+                Directory.Delete(session.Dir, recursive: true);
+                throw;
+            }
+            return new JsonObject { ["session_id"] = session.Id, ["dir"] = session.Dir };
+        });
         if (!File.Exists(config.Port))
         {
             warnings.Add($"port {config.Port} does not exist; logging will wait for it");
         }
-        return new JsonObject { ["session_id"] = session.Id, ["dir"] = session.Dir };
+        return started;
     }
 
     // Times a job n times. Native runs also report the ECU's reply latency (first byte after the echo).

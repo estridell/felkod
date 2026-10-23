@@ -155,10 +155,7 @@ sealed class SgbdDecoder
             return known;
         }
         decode.Capture();
-        lock (Sgbd.Gate)
-        {
-            Execute(job, args);
-        }
+        Execute(job, args);
         byte[]? request = decode.Captured.Count == 1 ? decode.Captured[0] : null;
         if (args == "")
         {
@@ -185,15 +182,12 @@ sealed class SgbdDecoder
         lock (gate)
         {
             decode.Answer(request, response);
-            lock (Sgbd.Gate)
-            {
-                bool ok = Execute(job, args);
-                return ok && decode.Problem == null ? Results.ToJson(ediabas.ResultSets) : null;
-            }
+            bool ok = Execute(job, args);
+            return ok && decode.Problem == null ? Results.ToJson(ediabas.ResultSets) : null;
         }
     }
 
-    bool Execute(string job, string args)
+    bool Execute(string job, string args) => Sgbd.Use(ediabas, () =>
     {
         ediabas.ArgString = args;
         ediabas.ArgBinaryStd = null;
@@ -207,5 +201,5 @@ sealed class SgbdDecoder
         {
             return false;
         }
-    }
+    });
 }

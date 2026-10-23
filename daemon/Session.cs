@@ -61,16 +61,26 @@ sealed class Session : IDisposable
         id = Path.GetFileName(dir);
         Directory.CreateDirectory(dir);
 
-        var db = new SqliteConnection($"Data Source={Path.Combine(dir, "session.sqlite")}");
-        db.Open();
-        Exec(db, Schema);
-        meta["id"] = id;
-        var session = new Session(id, dir, db, meta);
-        foreach (var (key, value) in meta.ToList())
+        // the builder quotes the path: a ';' in it (e.g. from XDG_DATA_HOME) would otherwise start another option
+        var db = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = Path.Combine(dir, "session.sqlite") }.ToString());
+        try
         {
-            session.SetMeta(key, value);
+            db.Open();
+            Exec(db, Schema);
+            meta["id"] = id;
+            var session = new Session(id, dir, db, meta);
+            foreach (var (key, value) in meta.ToList())
+            {
+                session.SetMeta(key, value);
+            }
+            return session;
         }
-        return session;
+        catch (Exception)
+        {
+            db.Dispose();
+            Directory.Delete(dir, recursive: true);
+            throw;
+        }
     }
 
     static void Exec(SqliteConnection db, string sql)
