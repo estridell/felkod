@@ -118,6 +118,27 @@ try
     Check(Directory.GetDirectories(config.SessionsDir).Length == 1, "one session directory");
     Check((await Call("log.stop"))!["ended_at"] != null && bus.Log == null, "log stopped");
 
+    // Work that starts a log is not a pause of that log, however long it takes. The first item makes
+    // the bus pick up the second while busy, which is when it times work as a possible pause.
+    var ahead = bus.Submit(() => { Thread.Sleep(100); return null; });
+    var slowStart = bus.Submit(() =>
+    {
+        Thread.Sleep(400);
+        var session = Session.Create(config.SessionsDir, new JsonObject());
+        bus.StartLog(new LogRun(session, ["INFO"], [], 1, 0, null));
+        return session.Dir;
+    });
+    await ahead;
+    string slowDir = (string)(await slowStart)!;
+    await Call("log.stop");
+    using (var db = new SqliteConnection($"Data Source={Path.Combine(slowDir, "session.sqlite")}"))
+    {
+        db.Open();
+        using var count = db.CreateCommand();
+        count.CommandText = "SELECT count(*) FROM events WHERE kind = 'paused'";
+        Check((long)count.ExecuteScalar()! == 0, "log start not recorded as a pause");
+    }
+
     // The socket: owner only, and a second server neither starts nor removes the first one's socket.
     var server = new RpcServer(config.SocketPath, handlers);
     server.Start();

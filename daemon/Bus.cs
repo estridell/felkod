@@ -181,11 +181,13 @@ sealed class Bus : IDisposable
     }
 
     // Runs queued work; if it held up a running log noticeably, the session records a paused event.
+    // Only a log that ran before the work can be held up by it: a log.start is not a pause of its own log.
     void ExecuteNoting(Work work)
     {
+        var before = Log;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         Execute(work);
-        if (Log is LogRun log && sw.Elapsed.TotalSeconds > PauseEventSeconds)
+        if (Log is LogRun log && log == before && sw.Elapsed.TotalSeconds > PauseEventSeconds)
         {
             try
             {
