@@ -91,12 +91,4 @@ static class Results
 
     public static string? UnitOf(JsonObject set, string name) =>
         name.EndsWith("_WERT") && set[name[..^"_WERT".Length] + "_EINH"] is JsonNode unit ? unit.GetValue<string>() : null;
-
-    // Jobs that only read. Anything else (STEUERN_*, *_LOESCHEN, *_PROGRAMMIEREN, ...) changes the car.
-    public static bool IsReadOnlyJob(string job)
-    {
-        string name = job.ToUpperInvariant();
-        return name.StartsWith('_') || name.StartsWith("STATUS_") || name.StartsWith("LESEN_") || name.EndsWith("_LESEN")
-            || name is "IDENT" or "IDENT_AIF" or "INFO" or "ECU_CONFIG";
-    }
 }
