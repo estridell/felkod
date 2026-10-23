@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using EdiabasLib;
+using Felkod.Daemon;
 
 var opts = new Dictionary<string, string>
 {
@@ -200,18 +201,10 @@ EdiabasNet CreateEdiabas()
     return instance;
 }
 
-// Jobs that only read. Anything else (STEUERN_*, *_LOESCHEN, *_PROGRAMMIEREN, ...) changes the car
-// and needs --allow-write yes.
-bool IsReadOnlyJob(string job)
-{
-    string name = job.ToUpperInvariant();
-    return name.StartsWith('_') || name.StartsWith("STATUS_") || name.StartsWith("LESEN_") || name.EndsWith("_LESEN")
-        || name is "IDENT" or "IDENT_AIF" or "INFO" or "ECU_CONFIG";
-}
-
+// Jobs that are not read-only (daemon/JobRules.cs) change the car and need --allow-write yes.
 void CheckWriteAllowed(string job)
 {
-    if (!allowWrite && !IsReadOnlyJob(job))
+    if (!allowWrite && !JobRules.IsReadOnlyJob(job))
     {
         throw new InvalidOperationException($"{job} is not a read-only job; pass --allow-write yes to run it");
     }

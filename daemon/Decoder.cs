@@ -121,6 +121,7 @@ sealed class SgbdDecoder
 {
     readonly EdiabasNet ediabas;
     readonly DecodeInterface decode = new();
+    // Args-free jobs only (the logging hot path). Args come from RPC callers, so caching them would grow without bound.
     readonly Dictionary<string, byte[]?> requests = new();
     // Used by the bus thread (native logging) and by RPC threads (offline decode).
     readonly object gate = new();
@@ -149,8 +150,7 @@ sealed class SgbdDecoder
 
     byte[]? RequestForLocked(string job, string args)
     {
-        string key = job + "\0" + args;
-        if (requests.TryGetValue(key, out var known))
+        if (args == "" && requests.TryGetValue(job, out var known))
         {
             return known;
         }
@@ -160,7 +160,10 @@ sealed class SgbdDecoder
             Execute(job, args);
         }
         byte[]? request = decode.Captured.Count == 1 ? decode.Captured[0] : null;
-        requests[key] = request;
+        if (args == "")
+        {
+            requests[job] = request;
+        }
         return request;
     }
 
@@ -168,7 +171,10 @@ sealed class SgbdDecoder
     {
         lock (gate)
         {
-            requests[job + "\0" + args] = null;
+            if (args == "")
+            {
+                requests[job] = null;
+            }
         }
     }
 

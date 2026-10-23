@@ -95,9 +95,31 @@ def call(method, params=None, autostart=True):
         raise Failure("daemon_gone", "felkodd closed the connection")
     except (FileNotFoundError, ConnectionRefusedError):
         raise Failure("daemon_not_running", "felkodd is not running; start it with: felkod daemon start")
-    response = json.loads(buffer)
+    try:
+        response = json.loads(buffer)
+    except ValueError as error:
+        raise Failure("daemon_protocol", f"invalid response from felkodd: {error}") from error
+    problem = response_problem(response)
+    if problem:
+        raise Failure("daemon_protocol", f"invalid response from felkodd: {problem}")
     response.pop("id", None)
     return response
+
+
+def response_problem(response):
+    """What is wrong with a decoded daemon response, or None if it has the documented shape."""
+    if not isinstance(response, dict):
+        return "not a JSON object"
+    if not isinstance(response.get("ok"), bool):
+        return "ok must be true or false"
+    if not isinstance(response.get("warnings", []), list):
+        return "warnings must be a list"
+    if response["ok"]:
+        return None if "data" in response else "ok response without data"
+    error = response.get("error")
+    if not isinstance(error, dict) or not all(isinstance(error.get(key), str) for key in ("code", "message")):
+        return "error response without a code and message"
+    return None
 
 
 def data(method, params=None):
