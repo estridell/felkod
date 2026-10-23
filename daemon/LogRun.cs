@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace Felkod.Daemon;
@@ -35,11 +36,10 @@ sealed class LogRun
     double lastProbe;
     double backoffUntil;
     string lastError = "";
-    volatile bool stopRequested;
 
     public string Id => session.Id;
     public string Dir => session.Dir;
-    public bool Finished => stopRequested || (durationS > 0 && clock.Elapsed.TotalSeconds >= durationS);
+    public bool Finished => durationS > 0 && clock.Elapsed.TotalSeconds >= durationS;
 
     public LogRun(Session session, string[] jobs, string[] slowJobs, int slowEvery, double durationS, int? nativeGapMs)
     {
@@ -50,8 +50,6 @@ sealed class LogRun
         this.slowEvery = slowEvery;
         this.durationS = durationS;
     }
-
-    public void RequestStop() => stopRequested = true;
 
     double Elapsed => Math.Round(clock.Elapsed.TotalSeconds, 3);
 
@@ -221,21 +219,6 @@ sealed class LogRun
     {
         lock (gate)
         {
-            var perJob = new JsonObject();
-            foreach (var (job, n) in samples)
-            {
-                perJob[job] = n;
-            }
-            var perJobErrors = new JsonObject();
-            foreach (var (job, n) in jobErrors)
-            {
-                perJobErrors[job] = n;
-            }
-            var perJobFallbacks = new JsonObject();
-            foreach (var (job, n) in fallbacks)
-            {
-                perJobFallbacks[job] = n;
-            }
             var currentOutages = (JsonArray)outages.DeepClone();
             if (!linkUp)
             {
@@ -257,9 +240,9 @@ sealed class LogRun
                 ["cycles"] = cycle,
                 ["cycles_per_s"] = seconds > 0 ? Math.Round(cycle / seconds, 2) : 0,
                 ["link_up"] = linkUp,
-                ["samples"] = perJob,
-                ["job_errors"] = perJobErrors,
-                ["native_fallbacks"] = perJobFallbacks,
+                ["samples"] = JsonSerializer.SerializeToNode(samples),
+                ["job_errors"] = JsonSerializer.SerializeToNode(jobErrors),
+                ["native_fallbacks"] = JsonSerializer.SerializeToNode(fallbacks),
                 ["outages"] = currentOutages,
             };
         }
@@ -272,7 +255,7 @@ sealed class LogRun
         try
         {
             session.SetMeta("ended_at", summary["ended_at"]);
-            session.SetMeta("summary", summary.DeepClone());
+            session.SetMeta("summary", summary);
         }
         finally
         {

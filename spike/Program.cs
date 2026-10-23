@@ -320,8 +320,6 @@ JsonObject RunLog()
     string[] SplitJobs(string list) => list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     string[] jobs = SplitJobs(opts["jobs"]);
     string[] slowJobs = SplitJobs(opts["slow-jobs"]);
-    int slowEvery = slowEveryCycles;
-    double duration = durationS;
     string logPath = Path.Combine(traceDir, "log.jsonl");
     if (jobs.Length == 0)
     {
@@ -351,7 +349,7 @@ JsonObject RunLog()
     double lastStillDown = 0;
     string lastProbeError = "";
 
-    bool Running() => !Stopping() && (duration <= 0 || clock.Elapsed.TotalSeconds < duration);
+    bool Running() => !Stopping() && (durationS <= 0 || clock.Elapsed.TotalSeconds < durationS);
     double Elapsed() => Math.Round(clock.Elapsed.TotalSeconds, 3);
     string Now() => clock.Elapsed.TotalSeconds.ToString("F1", CultureInfo.InvariantCulture);
     JsonObject Stamp(JsonObject line, DateTime? at = null, double? elapsed = null)
@@ -389,7 +387,7 @@ JsonObject RunLog()
     {
         if (linkUp)
         {
-            var cycleJobs = cycle % slowEvery == 0 ? jobs.Concat(slowJobs) : jobs;
+            var cycleJobs = cycle % slowEveryCycles == 0 ? jobs.Concat(slowJobs) : jobs;
             foreach (string job in cycleJobs)
             {
                 if (!Running())
@@ -466,23 +464,13 @@ JsonObject RunLog()
         });
     }
 
-    var perJob = new JsonObject();
-    foreach (var (job, n) in counts)
-    {
-        perJob[job] = n;
-    }
-    var perJobErrors = new JsonObject();
-    foreach (var (job, n) in jobErrors)
-    {
-        perJobErrors[job] = n;
-    }
     return new JsonObject
     {
         ["file"] = logPath,
         ["seconds"] = Math.Round(clock.Elapsed.TotalSeconds, 1),
         ["cycles"] = cycle,
-        ["samples"] = perJob,
-        ["job_errors"] = perJobErrors,
+        ["samples"] = JsonSerializer.SerializeToNode(counts),
+        ["job_errors"] = JsonSerializer.SerializeToNode(jobErrors),
         ["outages"] = outages,
         ["link_up_at_end"] = linkUp,
     };
@@ -511,30 +499,7 @@ JsonArray RunJob(string job, string argString)
         throw new TimeoutException($"{job}: no result within {jobTimeoutS} s");
     }
 
-    var sets = new JsonArray();
-    foreach (var set in ediabas.ResultSets)
-    {
-        var obj = new JsonObject();
-        foreach (var (name, data) in set)
-        {
-            obj[name] = data.OpData switch
-            {
-                byte[] bytes => Convert.ToHexString(bytes),
-                // JSON has no NaN/Infinity; keep them as strings rather than failing the job.
-                double d when !double.IsFinite(d) => d.ToString(CultureInfo.InvariantCulture),
-                double d => d,
-                long l => l,
-                string s => s,
-                null => null,
-                var other => other.ToString(),
-            };
-        }
-        sets.Add(obj);
-    }
-    return sets;
+    return Results.ToJson(ediabas.ResultSets);
 }
 
-class JobStatusException(string status) : Exception($"JOB_STATUS={status}")
-{
-    public string Status { get; } = status;
-}
+class JobStatusException(string status) : Exception($"JOB_STATUS={status}") { }

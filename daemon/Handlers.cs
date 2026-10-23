@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -128,13 +127,12 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
 
     JsonObject JobsList()
     {
-        var names = catalog.JobNames().OrderBy(name => name, StringComparer.Ordinal).ToList();
         var jobs = new JsonArray();
-        foreach (string name in names)
+        foreach (string name in catalog.JobNames().OrderBy(name => name, StringComparer.Ordinal))
         {
             jobs.Add(new JsonObject { ["name"] = name, ["read_only"] = JobRules.IsReadOnlyJob(name) });
         }
-        return new JsonObject { ["sgbd"] = catalog.SgbdFile, ["count"] = names.Count, ["jobs"] = jobs };
+        return new JsonObject { ["sgbd"] = catalog.SgbdFile, ["count"] = jobs.Count, ["jobs"] = jobs };
     }
 
     JsonObject JobsDescribe(string job)
@@ -160,21 +158,19 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(metadata) };
         }
         catalog.RequireJobs([job]);
-        if (!allowWrite && !JobRules.IsReadOnlyJob(job))
+        bool readOnly = JobRules.IsReadOnlyJob(job);
+        if (!allowWrite && !readOnly)
         {
             throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; pass allow_write to run it");
         }
-        if (!JobRules.IsReadOnlyJob(job))
+        // native resends a request after a garbled reply, which a job that changes the car must not get
+        if (native && !readOnly)
         {
-            // native resends a request after a garbled reply, which a job that changes the car must not get
-            if (native)
-            {
-                throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; native only runs read-only jobs");
-            }
+            throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; native only runs read-only jobs");
         }
         var sets = (JsonArray)(await bus.Submit(() =>
         {
-            if (!JobRules.IsReadOnlyJob(job))
+            if (!readOnly)
             {
                 Audit("job.run", new JsonObject { ["job"] = job, ["args"] = args });
             }
@@ -460,13 +456,10 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         {
             throw new FelkodException("bad_request", $"not a DS2 telegram: {Convert.ToHexString(request)}");
         }
-        if (!allowWrite)
+        if (!allowWrite && !ReadOnlyTelegrams().Contains(Convert.ToHexString(request)))
         {
-            if (!ReadOnlyTelegrams().Contains(Convert.ToHexString(request)))
-            {
-                throw new FelkodException("write_not_allowed",
-                    "not a telegram any read-only SGBD job sends; pass allow_write to send it anyway");
-            }
+            throw new FelkodException("write_not_allowed",
+                "not a telegram any read-only SGBD job sends; pass allow_write to send it anyway");
         }
         return await bus.Submit(() =>
         {

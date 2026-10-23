@@ -12,6 +12,7 @@
   <ItemGroup>
     <Compile Include="$(EdiabasLibDir)*.cs" Exclude="$(EdiabasLibDir)*Android.cs;$(EdiabasLibDir)BtLeGattSpp.cs" Link="EdiabasLib/%(Filename)%(Extension)" />
     <Compile Include="../daemon/JobRules.cs" Link="JobRules.cs" />
+    <Compile Include="../daemon/Results.cs" Link="Results.cs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="System.IO.Ports" Version="10.0.13" />

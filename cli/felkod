@@ -291,7 +291,7 @@ def cmd_read(args):
                                  "slow_every": args.slow_every, "duration_s": args.duration, "note": args.note,
                                  **native_params(args)})
     session_id = started["session_id"]
-    while (status := data("log.status", autostart=False)).get("session_id") == session_id:
+    while data("log.status", autostart=False).get("session_id") == session_id:
         # Poll even for a long duration: another CLI can stop the session, and passing an
         # arbitrarily large finite --duration straight to sleep overflows on some platforms.
         time.sleep(min(args.duration, 0.2))

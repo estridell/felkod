@@ -16,7 +16,7 @@ sealed class DecodeInterface : EdInterfaceBase
     bool capturing;
     byte[]? expectedRequest;
     byte[]? pendingResponse;
-    public string? Problem { get; private set; }
+    public bool Failed { get; private set; }
 
     public void Capture()
     {
@@ -24,7 +24,7 @@ sealed class DecodeInterface : EdInterfaceBase
         Captured.Clear();
         expectedRequest = null;
         pendingResponse = null;
-        Problem = null;
+        Failed = false;
     }
 
     public void Answer(byte[] request, byte[] response)
@@ -32,7 +32,7 @@ sealed class DecodeInterface : EdInterfaceBase
         capturing = false;
         expectedRequest = request;
         pendingResponse = response;
-        Problem = null;
+        Failed = false;
     }
 
     public override bool TransmitData(byte[] sendData, out byte[] receiveData)
@@ -56,15 +56,9 @@ sealed class DecodeInterface : EdInterfaceBase
             receiveData = dummy;
             return true;
         }
-        if (pendingResponse == null)
+        if (pendingResponse == null || !request.AsSpan().SequenceEqual(expectedRequest))
         {
-            Problem = "job sends more than one telegram";
-            Ediabas.SetError(EdiabasNet.ErrorCodes.EDIABAS_IFH_0009);
-            return false;
-        }
-        if (!request.AsSpan().SequenceEqual(expectedRequest))
-        {
-            Problem = $"job sent {Convert.ToHexString(request)}, expected {Convert.ToHexString(expectedRequest!)}";
+            Failed = true;
             Ediabas.SetError(EdiabasNet.ErrorCodes.EDIABAS_IFH_0009);
             return false;
         }
@@ -74,11 +68,6 @@ sealed class DecodeInterface : EdInterfaceBase
     }
 
     public override bool IsValidInterfaceName(string name) => name == "DECODE";
-    public override bool InterfaceConnect()
-    {
-        base.InterfaceConnect();
-        return true;
-    }
     public override bool InterfaceReset() => true;
     public override bool InterfaceBoot() => true;
     public override bool TransmitFrequent(byte[] sendData) => false;
@@ -144,24 +133,19 @@ sealed class SgbdDecoder
     {
         lock (gate)
         {
-            return RequestForLocked(job, args);
+            if (args == "" && requests.TryGetValue(job, out var known))
+            {
+                return known;
+            }
+            decode.Capture();
+            Execute(job, args);
+            byte[]? request = decode.Captured.Count == 1 ? decode.Captured[0] : null;
+            if (args == "")
+            {
+                requests[job] = request;
+            }
+            return request;
         }
-    }
-
-    byte[]? RequestForLocked(string job, string args)
-    {
-        if (args == "" && requests.TryGetValue(job, out var known))
-        {
-            return known;
-        }
-        decode.Capture();
-        Execute(job, args);
-        byte[]? request = decode.Captured.Count == 1 ? decode.Captured[0] : null;
-        if (args == "")
-        {
-            requests[job] = request;
-        }
-        return request;
     }
 
     public void MarkNotNative(string job, string args = "")
@@ -183,7 +167,7 @@ sealed class SgbdDecoder
         {
             decode.Answer(request, response);
             bool ok = Execute(job, args);
-            return ok && decode.Problem == null ? Results.ToJson(ediabas.ResultSets) : null;
+            return ok && !decode.Failed ? Results.ToJson(ediabas.ResultSets) : null;
         }
     }
 

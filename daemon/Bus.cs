@@ -436,7 +436,6 @@ sealed class Bus : IDisposable
         {
             throw new FelkodException("no_log", "no logging session is running");
         }
-        Log.RequestStop();
         return FinishLog();
     }
 

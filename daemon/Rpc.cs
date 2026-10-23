@@ -150,9 +150,7 @@ sealed class RpcServer(string path, Handlers handlers)
             var (code, message) = ex switch
             {
                 FelkodException f => (f.Code, f.Message),
-                JsonException => ("bad_request", ex.Message),
-                InvalidOperationException => ("bad_request", ex.Message),
-                FormatException or OverflowException => ("bad_request", ex.Message),
+                JsonException or InvalidOperationException or FormatException or OverflowException => ("bad_request", ex.Message),
                 _ => ("internal", $"{ex.GetType().Name}: {ex.Message}"),
             };
             return new JsonObject { ["id"] = id, ["ok"] = false, ["error"] = new JsonObject { ["code"] = code, ["message"] = message } };
