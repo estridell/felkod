@@ -54,6 +54,7 @@ def data_dir():
 def daemon_running():
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
             s.connect(str(socket_path()))
         return True
     except OSError:
@@ -93,11 +94,20 @@ def call(method, params=None, autostart=True):
     request = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            deadline = time.monotonic() + CALL_TIMEOUT_S
             s.settimeout(CALL_TIMEOUT_S)
             s.connect(str(socket_path()))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout()
+            s.settimeout(remaining)
             s.sendall(request.encode())
             buffer = b""
-            while not buffer.endswith(b"\n"):
+            while b"\n" not in buffer:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout()
+                s.settimeout(remaining)
                 chunk = s.recv(65536)
                 if not chunk:
                     raise Failure("daemon_gone", "felkodd closed the connection")
@@ -109,7 +119,7 @@ def call(method, params=None, autostart=True):
     except (FileNotFoundError, ConnectionRefusedError):
         raise Failure("daemon_not_running", "felkodd is not running; start it with: felkod daemon start")
     try:
-        response = json.loads(buffer)
+        response = json_loads(buffer.split(b"\n", 1)[0])
     except ValueError as error:
         raise Failure("daemon_protocol", f"invalid response from felkodd: {error}") from error
     problem = response_problem(response)
@@ -125,8 +135,9 @@ def response_problem(response):
         return "not a JSON object"
     if not isinstance(response.get("ok"), bool):
         return "ok must be true or false"
-    if not isinstance(response.get("warnings", []), list):
-        return "warnings must be a list"
+    warnings = response.get("warnings", [])
+    if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in warnings):
+        return "warnings must be a list of strings"
     if response["ok"]:
         return None if "data" in response else "ok response without data"
     error = response.get("error")
@@ -135,9 +146,20 @@ def response_problem(response):
     return None
 
 
-def data(method, params=None):
+def json_loads(value):
+    """Decode JSON without accepting Python's NaN/Infinity extensions or overflowing floats."""
+    def number(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite JSON number: {text}")
+        return value
+
+    return json.loads(value, parse_float=number, parse_constant=number)
+
+
+def data(method, params=None, *, autostart=True):
     """Calls the daemon and returns its data, raising Failure on an error response."""
-    response = call(method, params)
+    response = call(method, params, autostart=autostart)
     if not response["ok"]:
         raise Failure(response["error"]["code"], response["error"]["message"])
     WARNINGS.extend(response.get("warnings", []))
@@ -189,7 +211,7 @@ def cmd_status(args):
     if not daemon_running():
         return {"daemon": {"running": False, "socket": str(socket_path())},
                 "port": {"path": "/dev/felkod-kline", "present": os.path.exists("/dev/felkod-kline")}}
-    status = data("status")
+    status = data("status", autostart=False)
     status["daemon"]["running"] = True
     return status
 
@@ -215,9 +237,9 @@ def cmd_daemon(args):
     if args.action == "stop":
         if not daemon_running():
             return {"stopped": False, "already_stopped": True}
-        pid = data("status")["daemon"]["pid"]
+        pid = data("status", autostart=False)["daemon"]["pid"]
         try:
-            data("daemon.stop")
+            data("daemon.stop", autostart=False)
         except Failure as failure:
             if failure.code != "daemon_gone":  # it may close the socket before the reply is out
                 raise
@@ -269,9 +291,10 @@ def cmd_read(args):
                                  "slow_every": args.slow_every, "duration_s": args.duration, "note": args.note,
                                  **native_params(args)})
     session_id = started["session_id"]
-    time.sleep(args.duration)
-    while (status := data("log.status")).get("session_id") == session_id:
-        time.sleep(0.2)
+    while (status := data("log.status", autostart=False)).get("session_id") == session_id:
+        # Poll even for a long duration: another CLI can stop the session, and passing an
+        # arbitrarily large finite --duration straight to sleep overflows on some platforms.
+        time.sleep(min(args.duration, 0.2))
     return session_show(session_id)
 
 
@@ -309,15 +332,23 @@ def cmd_sessions(args):
     root = data_dir() / "sessions"
     running = None
     if daemon_running():
-        running = call("log.status", autostart=False).get("data", {}).get("session_id")
+        try:
+            status = data("log.status", autostart=False)
+            if not isinstance(status, dict):
+                raise Failure("daemon_protocol", "invalid log.status data from felkodd: not a JSON object")
+            running = status.get("session_id")
+        except (Failure, OSError) as error:
+            WARNINGS.append(f"could not check the running session: {error}")
     sessions = []
     for meta_path in sorted(root.glob("*/meta.json"), reverse=True):
         try:
-            meta = json.loads(meta_path.read_text())
-        except (OSError, json.JSONDecodeError):
+            meta = json_loads(meta_path.read_text())
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if not isinstance(meta, dict):
             continue
         meta["dir"] = str(meta_path.parent)
-        meta["running"] = meta.get("id") == running
+        meta["running"] = running is not None and meta.get("id") == running
         sessions.append(meta)
     return {"sessions_dir": str(root), "sessions": sessions}
 
@@ -340,8 +371,8 @@ def session_show(session_id):
         meta = {}
         for row in db.execute("SELECT key, value FROM meta"):
             try:  # non-string values are stored as JSON text
-                meta[row["key"]] = json.loads(row["value"]) if row["value"] is not None else None
-            except json.JSONDecodeError:
+                meta[row["key"]] = json_loads(row["value"]) if row["value"] is not None else None
+            except ValueError:
                 meta[row["key"]] = row["value"]
         span = db.execute("SELECT MIN(t) AS first, MAX(t) AS last, COUNT(*) AS samples FROM samples").fetchone()
         jobs = {row["job"]: {"samples": row["n"], "mean_ms": round(row["ms"], 1)} for row in db.execute(
@@ -365,6 +396,12 @@ def cmd_session(args):
     if len(rows) > args.limit:
         WARNINGS.append(f"truncated to {args.limit} rows; raise --limit or aggregate in SQL")
         rows = rows[:args.limit]
+    for row in rows:
+        for value in row:
+            if isinstance(value, bytes):
+                raise Failure("sql", "query returned a BLOB; use hex(column) or CAST(column AS TEXT) for JSON output")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise Failure("sql", "query returned a non-finite number, which JSON cannot represent")
     return {"columns": columns, "rows": [list(row) for row in rows], "row_count": len(rows)}
 
 

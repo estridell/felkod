@@ -22,6 +22,9 @@ loader.exec_module(cli)
 MALFORMED = (b"not json\n", b'{"ok": tr\n', b"\xff\xfe\n", b"[]\n", b"null\n", b"{}\n", b'{"ok": "yes", "data": {}}\n',
              b'{"ok": true}\n', b'{"ok": true, "data": {}, "warnings": null}\n',
              b'{"ok": true, "data": {}, "warnings": "link_lost"}\n', b'{"ok": false}\n',
+             b'{"ok": true, "data": {}, "warnings": [null]}\n',
+             b'{"ok": true, "data": {"value": NaN}}\n', b'{"ok": true, "data": {"value": Infinity}}\n',
+             b'{"ok": true, "data": {"value": 1e999}}\n',
              b'{"ok": false, "error": "link"}\n', b'{"ok": false, "error": {"code": "link"}}\n',
              b'{"ok": false, "error": {"message": "EDIABAS_IFH_0009"}}\n')
 
@@ -85,6 +88,19 @@ class ResponseTests(unittest.TestCase):
                 self.assertRaises(cli.Failure) as error:
             cli.data("status")
         self.assertEqual((error.exception.code, error.exception.message), ("link", "EDIABAS_IFH_0009"))
+
+    def test_reads_one_response_line(self):
+        with FakeDaemon(self.path, b'{"id": 1, "ok": true, "data": {"a": 1}}\npartial next line'):
+            self.assertEqual(cli.data("status"), {"a": 1})
+
+    def test_timeout_is_for_the_whole_response(self):
+        # Even a peer that keeps providing bytes must respect the call's overall deadline.
+        with patch.object(cli.socket, "socket") as socket_factory, patch.object(cli, "CALL_TIMEOUT_S", 1), \
+                patch.object(cli.time, "monotonic", side_effect=[0, 0.25, 0.5, 1.1]), \
+                self.assertRaises(cli.Failure) as error:
+            socket_factory.return_value.__enter__.return_value.recv.return_value = b'{"ok":'
+            cli.call("status", autostart=False)
+        self.assertEqual(error.exception.code, "daemon_timeout")
 
     def test_malformed_response_prints_json_failure(self):
         with FakeDaemon(self.path, b'{"ok": true}\n'):

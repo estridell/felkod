@@ -52,14 +52,8 @@ sealed class Session : IDisposable
 
     public static Session Create(string sessionsDir, JsonObject meta)
     {
-        string id = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-        string dir = Path.Combine(sessionsDir, id);
-        for (int n = 2; Directory.Exists(dir); n++)
-        {
-            dir = Path.Combine(sessionsDir, $"{id}-{n}");
-        }
-        id = Path.GetFileName(dir);
-        Directory.CreateDirectory(dir);
+        string dir = CreateDirectory(sessionsDir);
+        string id = Path.GetFileName(dir);
 
         // the builder quotes the path: a ';' in it (e.g. from XDG_DATA_HOME) would otherwise start another option
         var db = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = Path.Combine(dir, "session.sqlite") }.ToString());
@@ -80,6 +74,47 @@ sealed class Session : IDisposable
             db.Dispose();
             Directory.Delete(dir, recursive: true);
             throw;
+        }
+    }
+
+    // Different daemon sockets can share a data directory. Directory.CreateDirectory itself does
+    // not claim a name exclusively: a loser must never initialize or delete the winner's session.
+    static string CreateDirectory(string sessionsDir)
+    {
+        Directory.CreateDirectory(sessionsDir);
+        string prefix = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+        for (int n = 1; ; n++)
+        {
+            string dir = Path.Combine(sessionsDir, n == 1 ? prefix : $"{prefix}-{n}");
+            if (Directory.Exists(dir) || File.Exists(dir))
+            {
+                continue;
+            }
+            string reservation = dir + ".creating";
+            FileStream claim;
+            try
+            {
+                claim = new FileStream(reservation, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            }
+            catch (IOException) when (File.Exists(reservation) || Directory.Exists(dir))
+            {
+                continue;
+            }
+            try
+            {
+                // Another creator may have finished between the first check and our claim.
+                if (Directory.Exists(dir) || File.Exists(dir))
+                {
+                    continue;
+                }
+                Directory.CreateDirectory(dir);
+                return dir;
+            }
+            finally
+            {
+                claim.Dispose();
+                File.Delete(reservation);
+            }
         }
     }
 

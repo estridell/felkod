@@ -61,13 +61,29 @@ if (rest.Count == 0)
     return 2;
 }
 
+if (!double.TryParse(opts["job-timeout"], CultureInfo.InvariantCulture, out double jobTimeoutS)
+    || !double.IsFinite(jobTimeoutS) || jobTimeoutS <= 0)
+{
+    Console.Error.WriteLine("--job-timeout must be a finite number of seconds > 0");
+    return 2;
+}
+if (!double.TryParse(opts["duration"], CultureInfo.InvariantCulture, out double durationS)
+    || !double.IsFinite(durationS) || durationS < 0)
+{
+    Console.Error.WriteLine("--duration must be a finite number of seconds >= 0");
+    return 2;
+}
+if (!int.TryParse(opts["slow-every"], CultureInfo.InvariantCulture, out int slowEveryCycles) || slowEveryCycles < 1)
+{
+    Console.Error.WriteLine("--slow-every must be an integer >= 1");
+    return 2;
+}
+
 string traceDir = opts["trace-dir"];
 if (traceDir.Length == 0)
 {
     traceDir = Path.Combine(Directory.GetCurrentDirectory(), "traces", DateTime.Now.ToString("yyyyMMdd-HHmmss"));
 }
-Directory.CreateDirectory(traceDir);
-double jobTimeoutS = double.Parse(opts["job-timeout"], CultureInfo.InvariantCulture);
 bool allowWrite = opts["allow-write"] == "yes";
 
 // EdiabasLib reads SGBD text as Windows-1252, which .NET only ships as an opt-in provider.
@@ -100,7 +116,7 @@ var signalHandlers = new[] { PosixSignal.SIGINT, PosixSignal.SIGTERM, PosixSigna
 // Times the running job; EdiabasLib polls AbortJobFunc, which ends jobs past the deadline
 // (e.g. an ECU answering BUSY forever) and jobs interrupted by a stop signal.
 var jobClock = new Stopwatch();
-EdiabasNet ediabas = CreateEdiabas();
+EdiabasNet? ediabas = null;
 
 var output = new JsonObject
 {
@@ -108,11 +124,13 @@ var output = new JsonObject
     ["sgbd"] = opts["sgbd"],
     ["port"] = opts["port"],
     ["trace_dir"] = traceDir,
-    ["sgbd_file"] = ediabas.SgbdFileName,
 };
 
 try
 {
+    Directory.CreateDirectory(traceDir);
+    ediabas = CreateEdiabas();
+    output["sgbd_file"] = ediabas.SgbdFileName;
     switch (rest[0])
     {
         case "jobs":
@@ -156,7 +174,7 @@ catch (Exception ex)
     {
         ["type"] = ex.GetType().Name,
         ["message"] = ErrorText(ex),
-        ["ediabas_error"] = ediabas.ErrorCodeLast.ToString(),
+        ["ediabas_error"] = ediabas?.ErrorCodeLast.ToString(),
     };
 }
 finally
@@ -164,7 +182,7 @@ finally
     // Dispose stops EdiabasLib's foreground comm thread, closes the port and flushes the traces.
     try
     {
-        ediabas.Dispose();
+        ediabas?.Dispose();
     }
     catch (Exception)
     {
@@ -219,7 +237,7 @@ bool IsLinkError(Exception ex) =>
 string ErrorText(Exception ex) => ex switch
 {
     JobStatusException or TimeoutException => ex.Message,
-    _ when ediabas.ErrorCodeLast.ToString() is var code && code != "EDIABAS_ERR_NONE" => code,
+    _ when ediabas?.ErrorCodeLast.ToString() is string code && code != "EDIABAS_ERR_NONE" => code,
     _ => ex.Message,
 };
 
@@ -302,8 +320,8 @@ JsonObject RunLog()
     string[] SplitJobs(string list) => list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     string[] jobs = SplitJobs(opts["jobs"]);
     string[] slowJobs = SplitJobs(opts["slow-jobs"]);
-    int slowEvery = Math.Max(1, int.Parse(opts["slow-every"], CultureInfo.InvariantCulture));
-    double duration = double.Parse(opts["duration"], CultureInfo.InvariantCulture);
+    int slowEvery = slowEveryCycles;
+    double duration = durationS;
     string logPath = Path.Combine(traceDir, "log.jsonl");
     if (jobs.Length == 0)
     {
