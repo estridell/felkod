@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -9,11 +10,40 @@ namespace Felkod.Daemon;
 //           {"id": 1, "ok": false, "error": {"code": "link", "message": "EDIABAS_IFH_0009"}}.
 sealed class RpcServer(string path, Handlers handlers)
 {
+    // statx has a fixed Linux ABI, unlike struct stat, whose layout varies by architecture.
+    [StructLayout(LayoutKind.Explicit, Size = 256)]
+    struct FileStatus
+    {
+        [FieldOffset(28)] public ushort Mode;
+    }
+
+    [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
+    static extern int Statx(int directory, string path, int flags, uint mask, out FileStatus status);
+
     readonly CancellationTokenSource cts = new();
     Socket? listener;
     FileStream? ownership;
+    bool ownsSocket;
 
     public void Start()
+    {
+        if (listener != null || cts.IsCancellationRequested)
+        {
+            throw new InvalidOperationException("server already started or stopped");
+        }
+        try
+        {
+            Bind();
+        }
+        catch
+        {
+            ReleaseSocket();
+            throw;
+        }
+        _ = AcceptLoop();
+    }
+
+    void Bind()
     {
         // Held while the daemon runs. Without it, a second felkodd starting at the same moment (two CLI
         // calls that both auto-start one) can take the first one's socket, bound but not yet listening,
@@ -31,7 +61,6 @@ sealed class RpcServer(string path, Handlers handlers)
         }
         catch (IOException)
         {
-            ownership.Dispose();
             throw new InvalidOperationException($"another felkodd is already running on {path}");
         }
         if (File.Exists(path))
@@ -44,15 +73,23 @@ sealed class RpcServer(string path, Handlers handlers)
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionRefused)
             {
+                // connect() also returns ECONNREFUSED for ordinary files. Do not delete one, or
+                // follow a symlink, just because it happens to occupy the configured socket path.
+                const int AtCurrentDirectory = -100, NoFollow = 0x100;
+                if (Statx(AtCurrentDirectory, path, NoFollow, 1, out var status) != 0
+                    || (status.Mode & 0xF000) != 0xC000)
+                {
+                    throw new IOException($"refusing to replace a non-socket path: {path}");
+                }
                 File.Delete(path);  // stale socket from a daemon that did not shut down cleanly
             }
         }
         listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         listener.Bind(new UnixDomainSocketEndPoint(path));
+        ownsSocket = true;
         // Anyone who can connect can send writes to the car: owner only, whatever the umask.
         File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
         listener.Listen(16);
-        _ = AcceptLoop();
     }
 
     async Task AcceptLoop()
@@ -99,7 +136,8 @@ sealed class RpcServer(string path, Handlers handlers)
         JsonNode? id = null;
         try
         {
-            var request = JsonNode.Parse(line)?.AsObject() ?? throw new FelkodException("bad_request", "empty request");
+            var request = JsonNode.Parse(line, documentOptions: new JsonDocumentOptions { AllowDuplicateProperties = false })?.AsObject()
+                ?? throw new FelkodException("bad_request", "empty request");
             id = request["id"]?.DeepClone();
             string method = request["method"]?.GetValue<string>() ?? throw new FelkodException("bad_request", "missing method");
             var parameters = request["params"]?.AsObject() ?? new JsonObject();
@@ -114,6 +152,7 @@ sealed class RpcServer(string path, Handlers handlers)
                 FelkodException f => (f.Code, f.Message),
                 JsonException => ("bad_request", ex.Message),
                 InvalidOperationException => ("bad_request", ex.Message),
+                FormatException or OverflowException => ("bad_request", ex.Message),
                 _ => ("internal", $"{ex.GetType().Name}: {ex.Message}"),
             };
             return new JsonObject { ["id"] = id, ["ok"] = false, ["error"] = new JsonObject { ["code"] = code, ["message"] = message } };
@@ -123,14 +162,29 @@ sealed class RpcServer(string path, Handlers handlers)
     public void Stop()
     {
         cts.Cancel();
+        ReleaseSocket();
+    }
+
+    void ReleaseSocket()
+    {
         listener?.Dispose();
+        listener = null;
         try
         {
-            File.Delete(path);
+            // A failed start (or a server never started) must not unlink another daemon's socket.
+            if (ownsSocket)
+            {
+                File.Delete(path);
+            }
         }
         catch (IOException)
         {
         }
-        ownership?.Dispose();
+        finally
+        {
+            ownsSocket = false;
+            ownership?.Dispose();
+            ownership = null;
+        }
     }
 }

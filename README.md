@@ -94,7 +94,8 @@ are refused. Sessions and traces can contain the car's VIN.
 - Replies to single-telegram jobs are only decoded when their DS2 status is OK by BMW's own status table
   and their length matches earlier good replies to the same request, so a rejected or truncated reply
   never becomes data. The expected length is learned from the first good reply, so a short first reply
-  is not caught.
+  is not caught. Offline `ds2 decode` also checks lengths already learned from live replies; supplied
+  offline replies do not establish expected lengths.
 - The daemon's socket is accessible only to its owner.
 
 ## Development

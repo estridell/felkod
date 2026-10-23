@@ -292,6 +292,10 @@ sealed class Bus : IDisposable
         CloseNative();
     }
 
+    // Offline decoding uses the status and lengths learned from live exchanges too. Checking is
+    // thread-safe and does not touch the wire; supplied offline replies must not teach live lengths.
+    public void CheckReply(byte[] request, byte[] response) => guard.Check(request, response);
+
     // Runs a job with native DS2 transport and SGBD decoding when the job sends a single telegram;
     // otherwise (or if the decode does not fit) through EdiabasLib. Returns the raw exchange if native.
     public (JsonArray Sets, Ds2Exchange? Raw) RunJobNative(string job, string args, int gapMs)
@@ -459,7 +463,9 @@ sealed class Bus : IDisposable
         {
             shuttingDown = true;
         }
-        worker.Join(TimeSpan.FromSeconds(config.JobTimeoutS + 5));
+        // Thread.Join only accepts up to Int32.MaxValue milliseconds. Config's finite positive
+        // seconds can exceed that (or even TimeSpan's range); an idle bus must still stop cleanly.
+        worker.Join(TimeSpan.FromMilliseconds(Math.Min(config.JobTimeoutS * 1000 + 5000, int.MaxValue)));
     }
 
     public void Dispose() => Stop();

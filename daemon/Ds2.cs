@@ -106,7 +106,10 @@ sealed class Ds2Port : IDisposable
             {
                 throw new FelkodException(Corrupt, $"not a DS2 reply: {Convert.ToHexString(head)}", isLink: true);
             }
-            var tail = ReadExactly(length - 2, (length - 2) * ByteMs + interByteTimeoutMs);
+            // The ECU may pause between any two bytes. A single deadline for the entire tail
+            // both accepts an excessive individual gap in a long reply and rejects a reply
+            // whose individual gaps are valid but add up to more than that deadline.
+            var tail = ReadExactly(length - 2, ByteMs + interByteTimeoutMs, resetAfterRead: true);
             if (tail == null)
             {
                 throw new FelkodException(Corrupt, $"reply cut short after {Convert.ToHexString(head)}", isLink: true);
@@ -163,8 +166,9 @@ sealed class Ds2Port : IDisposable
         lastResponseEnd = Stopwatch.GetTimestamp();
     }
 
-    // Reads count bytes within timeoutMs; null on timeout.
-    byte[]? ReadExactly(int count, double timeoutMs)
+    // Reads count bytes within timeoutMs; for reply bodies the deadline restarts after each
+    // received chunk, so timeoutMs bounds the silence between bytes rather than total duration.
+    byte[]? ReadExactly(int count, double timeoutMs, bool resetAfterRead = false)
     {
         var buffer = new byte[count];
         int read = 0;
@@ -177,7 +181,12 @@ sealed class Ds2Port : IDisposable
             }
             try
             {
-                read += port.Read(buffer, read, count - read);
+                int received = port.Read(buffer, read, count - read);
+                read += received;
+                if (received > 0 && resetAfterRead)
+                {
+                    clock.Restart();
+                }
             }
             catch (TimeoutException)
             {
