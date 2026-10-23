@@ -11,8 +11,6 @@ if (config == null)
 
 // EdiabasLib reads SGBD text as Windows-1252, which .NET only ships as an opt-in provider.
 System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
-Directory.CreateDirectory(config.DataDir);
-Directory.CreateDirectory(config.SessionsDir);
 
 var shutdown = new ManualResetEventSlim();
 // The registrations must stay referenced, or the GC unregisters them.
@@ -30,6 +28,8 @@ RpcServer server;
 // e.g. no SGBD in the ECU path, or another felkodd on the socket: one line in felkodd.log, not a stack trace
 try
 {
+    Directory.CreateDirectory(config.DataDir);
+    Directory.CreateDirectory(config.SessionsDir);
     catalog = new Catalog(config);
     var decoder = new SgbdDecoder(config);
     bus = new Bus(config, decoder, catalog);

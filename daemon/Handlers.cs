@@ -49,7 +49,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         "ds2.raw" => await Ds2Raw(Str(p, "request"), Gap(p), OptBool(p, "allow_write")),
         "log.stop" => await bus.Submit(bus.StopLog),
         "log.status" => bus.Log?.Status() ?? new JsonObject { ["running"] = false },
-        "sessions.list" => SessionsList(),
+        "sessions.list" => SessionsList(warnings),
         "daemon.stop" => Shutdown(),
         _ => throw new FelkodException("unknown_method", $"unknown method: {method}"),
     };
@@ -79,8 +79,18 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         }
     }
 
-    static string[] StrList(JsonObject p, string key) =>
-        p[key] is JsonArray list ? list.Select(item => item!.GetValue<string>()).ToArray() : [];
+    static string[] StrList(JsonObject p, string key)
+    {
+        if (p[key] == null)
+        {
+            return [];
+        }
+        if (p[key] is not JsonArray list || list.Any(item => item is not JsonValue value || !value.TryGetValue<string>(out _)))
+        {
+            throw new FelkodException("bad_request", $"{key} must be an array of strings");
+        }
+        return list.Select(item => item!.GetValue<string>()).ToArray();
+    }
 
     JsonObject Status()
     {
@@ -161,9 +171,15 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             {
                 throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; native only runs read-only jobs");
             }
-            Audit("job.run", new JsonObject { ["job"] = job, ["args"] = args });
         }
-        var sets = (JsonArray)(await bus.Submit(() => native ? bus.RunJobNative(job, args, gapMs).Sets : bus.RunJob(job, args)))!;
+        var sets = (JsonArray)(await bus.Submit(() =>
+        {
+            if (!JobRules.IsReadOnlyJob(job))
+            {
+                Audit("job.run", new JsonObject { ["job"] = job, ["args"] = args });
+            }
+            return native ? bus.RunJobNative(job, args, gapMs).Sets : bus.RunJob(job, args);
+        }))!;
         Results.EnsureOkay(sets);
         return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(sets) };
     }
@@ -418,18 +434,14 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         var request = decoder.RequestFor(job, args)
             ?? throw new FelkodException("not_native", $"{job} does not send exactly one telegram");
         var response = Hex(responseHex);
-        // the same checks a live reply gets: framing, then BMW's status text, then the job's own status
+        // The same checks a live reply gets: framing, BMW's status and known length, then job status.
         if (response.Length < 4 || response[1] != response.Length || response[0] != request[0]
             || Ds2Port.Checksum(response.AsSpan(0, response.Length - 1)) != response[^1])
         {
             throw new FelkodException("bad_request",
                 $"not a complete DS2 reply from address {request[0]:X2} (length byte, checksum and address must match)");
         }
-        string status = catalog.StatusText(response[2]);
-        if (!Results.IsOkStatus(status))
-        {
-            throw new FelkodException("ecu_rejected", $"JOB_STATUS={status} (DS2 status {response[2]:X2})");
-        }
+        bus.CheckReply(request, response);
         var sets = decoder.Decode(job, args, request, response)
             ?? throw new FelkodException("decode_failed", $"{job} could not decode that reply");
         Results.EnsureOkay(sets);
@@ -456,12 +468,12 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
                     "not a telegram any read-only SGBD job sends; pass allow_write to send it anyway");
             }
         }
-        if (allowWrite)
-        {
-            Audit("ds2.raw", new JsonObject { ["request"] = Convert.ToHexString(request) });
-        }
         return await bus.Submit(() =>
         {
+            if (allowWrite)
+            {
+                Audit("ds2.raw", new JsonObject { ["request"] = Convert.ToHexString(request) });
+            }
             var exchange = bus.RawExchange(request, gapMs, allowRetry: false);
             return new JsonObject
             {
@@ -476,7 +488,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         });
     }
 
-    JsonObject SessionsList()
+    JsonObject SessionsList(JsonArray warnings)
     {
         var sessions = new JsonArray();
         if (Directory.Exists(config.SessionsDir))
@@ -484,11 +496,21 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             foreach (string dir in Directory.GetDirectories(config.SessionsDir).OrderDescending(StringComparer.Ordinal))
             {
                 string metaPath = Path.Combine(dir, "meta.json");
-                if (File.Exists(metaPath) && JsonNode.Parse(File.ReadAllText(metaPath)) is JsonObject meta)
+                if (!File.Exists(metaPath))
                 {
+                    continue;
+                }
+                try
+                {
+                    var meta = JsonNode.Parse(File.ReadAllText(metaPath)) as JsonObject
+                        ?? throw new JsonException("metadata is not an object");
                     meta["dir"] = dir;
-                    meta["running"] = bus.Log?.Id == meta["id"]?.GetValue<string>();
+                    meta["running"] = bus.Log?.Id is string runningId && meta["id"]?.GetValue<string>() == runningId;
                     sessions.Add(meta);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+                {
+                    warnings.Add($"could not read session metadata {metaPath}: {ex.Message}");
                 }
             }
         }

@@ -139,6 +139,10 @@ try
         Check((long)count.ExecuteScalar()! == 0, "log start not recorded as a pause");
     }
 
+    await HandlerSessionChecks.Run(config, handlers, Check);
+    TransportChecks.Run(config, catalog, decoder, Check);
+    await RpcChecks.Run(config, handlers, Check);
+
     // The socket: owner only, and a second server neither starts nor removes the first one's socket.
     var server = new RpcServer(config.SocketPath, handlers);
     server.Start();
