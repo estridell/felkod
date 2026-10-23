@@ -47,7 +47,7 @@ sealed class LogRun
         this.session = session;
         this.jobs = jobs;
         this.slowJobs = slowJobs;
-        this.slowEvery = Math.Max(1, slowEvery);
+        this.slowEvery = slowEvery;
         this.durationS = durationS;
     }
 
@@ -172,9 +172,10 @@ sealed class LogRun
         Results.EnsureOkay(sets);
         if (exchange != null)
         {
-            // native: stamp the moment the request went out, after the gap wait
-            startedAt = startedAt.AddMilliseconds(exchange.WaitedMs);
-            startedElapsed = Math.Round(startedElapsed + exchange.WaitedMs / 1000, 3);
+            // native: stamp the moment the final request went out, after the gap wait, opening the port
+            // or a resend; elapsed_s from the monotonic clock, so a wall clock step can't move it
+            startedAt = exchange.SentAt;
+            startedElapsed = Math.Round((clock.Elapsed - Stopwatch.GetElapsedTime(exchange.SentTimestamp)).TotalSeconds, 3);
         }
         session.AddSample(startedAt, startedElapsed, sampleCycle, job, Math.Round(sw.Elapsed.TotalMilliseconds, 1), sets, exchange);
         bool firstFallback = false;
@@ -268,9 +269,15 @@ sealed class LogRun
     {
         var summary = Status();
         summary["ended_at"] = DateTime.UtcNow.ToString("o");
-        session.SetMeta("ended_at", summary["ended_at"]);
-        session.SetMeta("summary", summary.DeepClone());
-        session.Dispose();
+        try
+        {
+            session.SetMeta("ended_at", summary["ended_at"]);
+            session.SetMeta("summary", summary.DeepClone());
+        }
+        finally
+        {
+            session.Dispose();
+        }
         return summary;
     }
 }

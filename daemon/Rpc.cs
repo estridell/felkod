@@ -11,9 +11,29 @@ sealed class RpcServer(string path, Handlers handlers)
 {
     readonly CancellationTokenSource cts = new();
     Socket? listener;
+    FileStream? ownership;
 
     public void Start()
     {
+        // Held while the daemon runs. Without it, a second felkodd starting at the same moment (two CLI
+        // calls that both auto-start one) can take the first one's socket, bound but not yet listening,
+        // for a stale one and replace it. The file stays when felkodd exits, so the lock is always on one inode.
+        ownership = new FileStream(path + ".lock", new FileStreamOptions
+        {
+            Mode = FileMode.OpenOrCreate,
+            Access = FileAccess.ReadWrite,
+            Share = FileShare.ReadWrite,
+            UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+        });
+        try
+        {
+            ownership.Lock(0, 1);
+        }
+        catch (IOException)
+        {
+            ownership.Dispose();
+            throw new InvalidOperationException($"another felkodd is already running on {path}");
+        }
         if (File.Exists(path))
         {
             using var probe = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
@@ -22,13 +42,15 @@ sealed class RpcServer(string path, Handlers handlers)
                 probe.Connect(new UnixDomainSocketEndPoint(path));
                 throw new InvalidOperationException($"another felkodd is already listening on {path}");
             }
-            catch (SocketException)
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionRefused)
             {
                 File.Delete(path);  // stale socket from a daemon that did not shut down cleanly
             }
         }
         listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         listener.Bind(new UnixDomainSocketEndPoint(path));
+        // Anyone who can connect can send writes to the car: owner only, whatever the umask.
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
         listener.Listen(16);
         _ = AcceptLoop();
     }
@@ -109,5 +131,6 @@ sealed class RpcServer(string path, Handlers handlers)
         catch (IOException)
         {
         }
+        ownership?.Dispose();
     }
 }

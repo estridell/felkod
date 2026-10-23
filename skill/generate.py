@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """Writes skill/SKILL.md from the felkod CLI's own --help output, so the skill is a plain reference."""
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "cli" / "felkod"
+# argparse lays out help differently between Python versions, so SKILL.md is generated with this one;
+# CI regenerates it with the same version and fails on any difference.
+PYTHON = (3, 14)
 COMMANDS = ["status", "daemon", "ident", "faults", "jobs", "run", "read", "log", "bench", "ds2", "sessions", "session"]
 
 
 def help_text(*args):
-    return subprocess.run([sys.executable, str(CLI), *args, "--help"], capture_output=True, text=True, check=True).stdout
+    # fixed width and no color, whatever the terminal
+    env = {**os.environ, "COLUMNS": "80", "PYTHON_COLORS": "0"}
+    return subprocess.run([sys.executable, str(CLI), *args, "--help"], capture_output=True, text=True, check=True, env=env).stdout
 
 
 def main():
+    if sys.version_info[:2] != PYTHON:
+        sys.exit(f"skill/generate.py needs Python {PYTHON[0]}.{PYTHON[1]} (this is {sys.version.split()[0]}): "
+                 "argparse formats help differently in other versions")
     parts = [
         "---",
         "name: felkod",
