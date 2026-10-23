@@ -67,7 +67,6 @@ sealed class Bus : IDisposable
     const int Ds2InterByteTimeoutMs = 20;
 
     readonly Config config;
-    readonly SgbdDecoder decoder;
     readonly Catalog catalog;
     readonly ReplyGuard guard;
     readonly BlockingCollection<Work> queue = new();
@@ -83,10 +82,9 @@ sealed class Bus : IDisposable
     public LinkState Link { get; } = new();
     public LogRun? Log { get; private set; }
 
-    public Bus(Config config, SgbdDecoder decoder, Catalog catalog)
+    public Bus(Config config, Catalog catalog)
     {
         this.config = config;
-        this.decoder = decoder;
         this.catalog = catalog;
         guard = new ReplyGuard(catalog);
         traceDir = config.TraceDir;
@@ -214,15 +212,13 @@ sealed class Bus : IDisposable
         }
     }
 
-    // Runs one SGBD job on the worker thread. Throws FelkodException: IsLink for communication
+    // Runs one SGBD job on the worker thread and validates its results. IsLink marks communication
     // failures and deadline overruns, which also force a fresh EdiabasLib instance for the next job.
     public JsonArray RunJob(string job, string args = "")
     {
         EnsureInstance();
         var e = ediabas!;
         e.ArgString = args;
-        e.ArgBinaryStd = null;
-        e.ResultsRequests = "";
         Exception? failure = null;
         JsonArray? sets = null;
         var observed = (ObservedObd)e.EdInterfaceClass;
@@ -272,15 +268,19 @@ sealed class Bus : IDisposable
         {
             var (request, response) = observed.Exchanges[0];
             guard.Check(request, response);
-            // only a reply the job accepted sets the expected length
-            Results.EnsureOkay(sets!);
+        }
+        Results.EnsureOkay(sets!);
+        // Only a reply the job accepted sets the expected length.
+        if (observed.Exchanges.Count == 1)
+        {
+            var (request, response) = observed.Exchanges[0];
             guard.Learn(request, response);
         }
         return sets!;
     }
 
     // Logging sessions trace into their own folder; switching needs a new instance.
-    public void SetTraceDir(string dir)
+    void SetTraceDir(string dir)
     {
         traceDir = dir;
         needsReset = true;
@@ -300,7 +300,7 @@ sealed class Bus : IDisposable
     // otherwise (or if the decode does not fit) through EdiabasLib. Returns the raw exchange if native.
     public (JsonArray Sets, Ds2Exchange? Raw) RunJobNative(string job, string args, int gapMs)
     {
-        var request = decoder.RequestFor(job, args);
+        var request = catalog.RequestFor(job, args);
         if (request == null)
         {
             return (RunJob(job, args), null);
@@ -308,7 +308,7 @@ sealed class Bus : IDisposable
         var exchange = RawExchange(request, gapMs, allowRetry: true);
         // status (BUSY would make the SGBD resend) and length are checked before decoding
         guard.Check(request, exchange.Response);
-        var sets = decoder.Decode(job, args, request, exchange.Response);
+        var sets = catalog.Decode(job, args, request, exchange.Response);
         if (sets != null)
         {
             Results.EnsureOkay(sets);
@@ -321,7 +321,7 @@ sealed class Bus : IDisposable
                 $"JOB_STATUS={catalog.StatusText(exchange.Response[2])}; the SGBD could not decode the reply");
         }
         // An OK reply the job could not finish on: it really needs more than one telegram.
-        decoder.MarkNotNative(job, args);
+        catalog.MarkNotNative(job, args);
         return (RunJob(job, args), null);
     }
 
@@ -468,88 +468,4 @@ sealed class Bus : IDisposable
     }
 
     public void Dispose() => Stop();
-}
-
-// Offline access to the SGBD's own metadata (_JOBS, _RESULTS, ...). A separate instance so job
-// listings never wait behind a running log. It never connects, and it is never disposed:
-// disposing any EdInterfaceObd closes the serial port shared by all instances.
-sealed class Catalog
-{
-    readonly object gate = new();
-    readonly EdiabasNet ediabas;
-    HashSet<string>? jobNames;
-
-    public Catalog(Config config)
-    {
-        lock (Sgbd.Gate)
-        {
-            ediabas = new EdiabasNet();
-            ediabas.EdInterfaceClass = new EdInterfaceObd { ComPort = "none" };
-            ediabas.SetConfigProperty("EcuPath", config.EcuPath);
-            ediabas.SetConfigProperty("ApiTrace", "0");
-            ediabas.SetConfigProperty("IfhTrace", "0");
-            ediabas.NoInitForVJobs = true;
-            ediabas.ResolveSgbdFile(config.Sgbd);
-        }
-        try
-        {
-            foreach (var row in Run("_TABLE", "JOBRESULT").Skip(2))
-            {
-                var cells = row!.AsObject().Select(cell => cell.Value?.ToString()).ToList();
-                if (cells.Count >= 2 && cells[0] is string sb && sb.StartsWith("0x"))
-                {
-                    StatusTexts[Convert.ToByte(sb[2..], 16)] = cells[1] ?? "";
-                }
-            }
-        }
-        catch (Exception ex) when (ex is not OutOfMemoryException)
-        {
-            Console.Error.WriteLine($"felkodd: no usable JOBRESULT table in {SgbdFile}: {ex.Message}");
-        }
-    }
-
-    // BMW's text for a DS2 status byte; without a JOBRESULT table only 0xA0 counts as OKAY.
-    public string StatusText(byte status) =>
-        StatusTexts.TryGetValue(status, out var text) ? text : status == 0xA0 && StatusTexts.Count == 0 ? "OKAY" : $"unknown status {status:X2}";
-
-    // DS2 status byte -> BMW's text for it (the SGBD's JOBRESULT table), e.g. 0xA2 -> ERROR_ECU_REJECTED.
-    public Dictionary<byte, string> StatusTexts { get; } = new();
-
-    public string SgbdFile => ediabas.SgbdFileName;
-
-    public JsonArray Run(string vjob, string args = "")
-    {
-        lock (gate)
-        {
-            return Sgbd.Use(ediabas, () =>
-            {
-                ediabas.ArgString = args;
-                ediabas.ArgBinaryStd = null;
-                ediabas.ResultsRequests = "";
-                ediabas.ExecuteJob(vjob);
-                return Results.ToJson(ediabas.ResultSets);
-            });
-        }
-    }
-
-    public HashSet<string> JobNames()
-    {
-        lock (gate)
-        {
-            jobNames ??= Run("_JOBS").Skip(1)
-                .Select(set => set!["JOBNAME"]?.GetValue<string>())
-                .OfType<string>()
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            return jobNames;
-        }
-    }
-
-    public void RequireJobs(IEnumerable<string> jobs)
-    {
-        var unknown = jobs.Where(job => !JobNames().Contains(job)).ToList();
-        if (unknown.Count > 0)
-        {
-            throw new FelkodException("unknown_job", $"not in {SgbdFile}: {string.Join(", ", unknown)}");
-        }
-    }
 }

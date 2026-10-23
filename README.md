@@ -13,8 +13,8 @@ BMW's own job descriptions say; it does not interpret the data.
 v0.1, developed against one car: a 2002 E46 320Ci (M54B22, MS43, software 430066).
 
 - Tested on the car: identification, fault reading, EdiabasLib-based logging and link recovery across
-  stalls and ignition cycles (engine running, via the Phase 0 spike in `spike/`); the felkod daemon and
-  CLI with the engine off.
+  stalls and ignition cycles (engine running, via the now-retired Phase 0 prototype); the felkod daemon
+  and CLI with the engine off.
 - Tested only against a simulator so far: the native DS2 transport (`--native`).
 - MS43 over DS2 (K-line) only. Other ECUs may work wherever EdiabasLib and an SGBD do, but are untested.
 
@@ -47,7 +47,7 @@ In a checkout made without `--recurse-submodules`, run `git submodule update --i
 started with `felkod daemon start --ecu-path DIR` (or `--port`, `--sgbd`) keeps those settings until
 `felkod daemon stop`; a daemon started on first use has the defaults.
 
-Linux serial access: install `spike/99-felkod.rules` into `/etc/udev/rules.d/` (1 ms FTDI latency timer,
+Linux serial access: install `udev/99-felkod.rules` into `/etc/udev/rules.d/` (1 ms FTDI latency timer,
 `/dev/felkod-kline` symlink; the port keeps the distribution's serial group), run
 `sudo udevadm control --reload-rules`, replug the cable, and add your user to that group (`uucp` on Arch,
 `dialout` on Debian/Ubuntu; log in again afterwards).
@@ -105,7 +105,6 @@ pseudo-terminal as the ECU):
 
 ```
 dotnet build -c Release daemon
-dotnet build -c Release spike
 dotnet run --project tests -c Release
 python3 -m unittest discover -s tests -v
 python3 skill/generate.py && git diff --exit-code -- skill/SKILL.md
@@ -116,11 +115,15 @@ versions. See `CONTRIBUTING.md`.
 
 ## Layout
 
+RPC and `Handlers` validate and dispatch requests; `Bus` alone executes live ECU jobs and owns the port.
+`Catalog` handles offline SGBD metadata, telegram capture and replay. `LogRun` schedules samples and
+`Session` stores them. `Sgbd` serializes access to EdiabasLib's shared interpreter registers.
+
 - `daemon/` — `felkodd` (C#, .NET 10): owns the K-line, runs SGBD jobs via EdiabasLib and native DS2,
   logging sessions into SQLite
 - `cli/felkod` — the CLI (Python, stdlib only)
 - `skill/` — `SKILL.md` for agents, generated from the CLI's `--help` by `skill/generate.py`
-- `spike/` — the Phase 0 test program, and the udev rule
+- `udev/` — the cable's stable `/dev/felkod-kline` name and 1 ms FTDI latency setting
 - `tests/` — the hardware-free checks (daemon in C#, CLI and daemon together in Python)
 - `vendor/ediabaslib/` — EdiabasLib (git submodule, GPLv3)
 - `vendor/bmw/` — your BMW SGBD files (not in the repo; see `vendor/README.md`)

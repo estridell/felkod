@@ -99,7 +99,7 @@ class ResponseTests(unittest.TestCase):
                 patch.object(cli.time, "monotonic", side_effect=[0, 0.25, 0.5, 1.1]), \
                 self.assertRaises(cli.Failure) as error:
             socket_factory.return_value.__enter__.return_value.recv.return_value = b'{"ok":'
-            cli.call("status", autostart=False)
+            cli.data("status", autostart=False)
         self.assertEqual(error.exception.code, "daemon_timeout")
 
     def test_malformed_response_prints_json_failure(self):

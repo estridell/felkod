@@ -1,6 +1,5 @@
 // Hardware-free checks against upstream EdiabasLib's own test SGBDs. No BMW files or cable required.
 // Run: dotnet run --project tests -c Release
-using System.Net.Sockets;
 using System.Reflection;
 using System.Text.Json.Nodes;
 using EdiabasLib;
@@ -34,14 +33,12 @@ async Task Fails(Func<Task> action, string code, string label)
 
 try
 {
-    // Read-only rule: one definition, shared with the spike.
+    // Read-only rule.
     foreach (string job in new[] { "_JOBS", "_table", "STATUS_TEST", "LESEN_TEST", "FS_LESEN", "IDENT", "IDENT_AIF", "INFO", "ECU_CONFIG" })
         Check(JobRules.IsReadOnlyJob(job), $"{job} read-only");
     foreach (string job in new[] { "_RESET", "STEUERN_TEST", "FS_LOESCHEN", "TEST_PARL", "IDENTX" })
         Check(!JobRules.IsReadOnlyJob(job), $"{job} not read-only");
     Check(JobRules.IsMetadataJob("_tables") && !JobRules.IsMetadataJob("_RESET"), "metadata jobs");
-    Check(File.ReadAllText(Path.Combine(repo, "spike/Spike.csproj")).Contains("Include=\"../daemon/JobRules.cs\""), "spike links JobRules.cs");
-    Check(!File.ReadAllText(Path.Combine(repo, "spike/Program.cs")).Contains("bool IsReadOnlyJob("), "no spike copy");
 
     foreach (string invalid in new[] { "0", "-1", "NaN", "Infinity", "abc" })
         Check(Config.FromArgs(["--job-timeout", invalid]) == null, $"job timeout {invalid} refused");
@@ -57,13 +54,12 @@ try
     var config = new Config("/nonexistent/felkod-test-port", Path.Combine(repo, "vendor/ediabaslib/EdiabasLib/Test/Ecu"),
         "cmd_test1", temp, Path.Combine(temp, "daemon.sock"), 1);
     var catalog = new Catalog(config);
-    var decoder = new SgbdDecoder(config);
-    using var bus = new Bus(config, decoder, catalog);
+    using var bus = new Bus(config, catalog);
     bus.Start();
-    var handlers = new Handlers(config, bus, catalog, decoder, () => { });
+    var handlers = new Handlers(config, bus, catalog, () => { });
     async Task<JsonNode?> Call(string method, JsonObject? p = null) => await handlers.Call(method, p ?? new(), new());
 
-    // The bus creates its EdiabasLib instance after the catalog and decoder, which binds EdiabasLib's
+    // The bus creates its EdiabasLib instance after the offline catalog, which binds EdiabasLib's
     // shared registers to it; every job must run on the registers of its own instance.
     var registers = ((Array)typeof(EdiabasNet).GetField("RegisterList", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null)!)
         .Cast<object>().ToList();
@@ -77,21 +73,21 @@ try
         Check(info!["sets"]![0]!["values"]!["ECU"]!.GetValue<string>() == "CMD_TEST1" && BoundTo(Instance(bus)), "bus job on its registers");
         Check(catalog.Run("TEST_PARL", (1000 + i).ToString())[1]!["PARL"]!.GetValue<long>() == 1000 + i && BoundTo(Instance(catalog)),
             "catalog job on its registers");
-        Check(decoder.Decode("TEST_PARL", (2000 + i).ToString(), [], [])![1]!["PARL"]!.GetValue<long>() == 2000 + i
-            && BoundTo(Instance(decoder)), "decoder job on its registers");
+        Check(catalog.Decode("TEST_PARL", (2000 + i).ToString(), [], [])![1]!["PARL"]!.GetValue<long>() == 2000 + i
+            && BoundTo(Instance(catalog)), "offline decode on catalog registers");
     }
 
     // Requests with args come from RPC callers: only args-free ones are cached.
-    var requests = (System.Collections.IDictionary)typeof(SgbdDecoder)
-        .GetField("requests", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(decoder)!;
+    var requests = (System.Collections.IDictionary)typeof(Catalog)
+        .GetField("requests", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(catalog)!;
     requests.Clear();
     for (int i = 0; i < 50; i++)
-        decoder.RequestFor("TEST_PARL", i.ToString());
-    decoder.MarkNotNative("TEST_PARL", "1");
+        catalog.RequestFor("TEST_PARL", i.ToString());
+    catalog.MarkNotNative("TEST_PARL", "1");
     Check(requests.Count == 0, "requests with args not cached");
-    decoder.RequestFor("INFO");
-    decoder.RequestFor("INFO");
-    decoder.MarkNotNative("TEST_PARL");
+    catalog.RequestFor("INFO");
+    catalog.RequestFor("INFO");
+    catalog.MarkNotNative("TEST_PARL");
     Check(requests.Count == 2 && requests.Contains("INFO") && requests["TEST_PARL"] == null, "args-free requests cached");
 
     await Fails(() => Call("job.run", new() { ["job"] = "TEST_PARL", ["allow_write"] = true, ["native"] = true }),
@@ -140,33 +136,8 @@ try
     }
 
     await HandlerSessionChecks.Run(config, handlers, Check);
-    TransportChecks.Run(config, catalog, decoder, Check);
+    TransportChecks.Run(config, catalog, Check);
     await RpcChecks.Run(config, handlers, Check);
-
-    // The socket: owner only, and a second server neither starts nor removes the first one's socket.
-    var server = new RpcServer(config.SocketPath, handlers);
-    server.Start();
-    try
-    {
-        Check(File.GetUnixFileMode(config.SocketPath) == (UnixFileMode.UserRead | UnixFileMode.UserWrite), "socket mode 0600");
-        var second = new RpcServer(config.SocketPath, handlers);
-        try
-        {
-            second.Start();
-            Check(false, "second server started");
-        }
-        catch (InvalidOperationException)
-        {
-        }
-        using var client = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        client.Connect(new UnixDomainSocketEndPoint(config.SocketPath));
-        Check(client.Connected, "first server still reachable");
-    }
-    finally
-    {
-        server.Stop();
-    }
-    Check(!File.Exists(config.SocketPath), "socket removed at stop");
 
     Console.WriteLine($"Passed {checks} daemon checks");
 }

@@ -1,6 +1,6 @@
 namespace Felkod.Daemon;
 
-// Which jobs run without allow_write. Compiled into the spike too (spike/Spike.csproj), so both agree.
+// Which jobs run without allow_write.
 static class JobRules
 {
     // EDIABAS's built-in metadata jobs: they read the SGBD file itself and never talk to the ECU.

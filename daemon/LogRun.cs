@@ -11,15 +11,8 @@ namespace Felkod.Daemon;
 // succeeds (link_restored). Other job failures (e.g. the ECU rejecting a request) record job_error
 // and logging continues after a short back-off. Native logs record not_native the first time a job
 // has to fall back to EdiabasLib, and count those samples.
-sealed class LogRun
+sealed class LogRun(Session session, string[] jobs, string[] slowJobs, int slowEvery, double durationS, int? nativeGapMs)
 {
-    readonly Session session;
-    readonly string[] jobs;
-    readonly string[] slowJobs;
-    readonly int slowEvery;
-    readonly double durationS;
-    // Native DS2 transport (SGBD-decoded) with this gap before each request, or EdiabasLib jobs when null.
-    readonly int? nativeGapMs;
     readonly Stopwatch clock = Stopwatch.StartNew();
     readonly DateTime startedAt = DateTime.UtcNow;
     readonly Dictionary<string, int> samples = new();
@@ -40,16 +33,6 @@ sealed class LogRun
     public string Id => session.Id;
     public string Dir => session.Dir;
     public bool Finished => durationS > 0 && clock.Elapsed.TotalSeconds >= durationS;
-
-    public LogRun(Session session, string[] jobs, string[] slowJobs, int slowEvery, double durationS, int? nativeGapMs)
-    {
-        this.nativeGapMs = nativeGapMs;
-        this.session = session;
-        this.jobs = jobs;
-        this.slowJobs = slowJobs;
-        this.slowEvery = slowEvery;
-        this.durationS = durationS;
-    }
 
     double Elapsed => Math.Round(clock.Elapsed.TotalSeconds, 3);
 
@@ -167,7 +150,6 @@ sealed class LogRun
     {
         var sw = Stopwatch.StartNew();
         var (sets, exchange) = nativeGapMs is int gap ? bus.RunJobNative(job, "", gap) : (bus.RunJob(job), null);
-        Results.EnsureOkay(sets);
         if (exchange != null)
         {
             // native: stamp the moment the final request went out, after the gap wait, opening the port

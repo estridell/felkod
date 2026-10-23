@@ -74,6 +74,11 @@ class TransportTests(unittest.TestCase):
         self.start()
         live = self.rpc("job.run", {"job": "STATUS_UBATT", "native": True, "gap_ms": 0})
         self.assertTrue(live["ok"], live)
+        # Metadata and request capture share the offline interpreter with replay.
+        metadata = self.rpc("jobs.describe", {"job": "STATUS_UBATT"})
+        self.assertTrue(metadata["ok"], metadata)
+        captured = self.rpc("ds2.request", {"job": "STATUS_UBATT"})
+        self.assertEqual(captured["data"]["request"], fixture.UBATT_REQUEST.hex().upper())
         decoded = self.rpc("ds2.decode", {"job": "STATUS_UBATT", "response": good.hex()})
         self.assertTrue(decoded["ok"], decoded)
         self.assertEqual(decoded["data"]["sets"], live["data"]["sets"])
