@@ -29,7 +29,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
     // about 2 s of SGBD work, which must not happen in the middle of a log.
     public void WarmUp() => ReadOnlyTelegrams();
 
-    HashSet<string> ReadOnlyTelegrams() => readOnlyTelegrams ??= catalog.JobNames().Where(Results.IsReadOnlyJob)
+    HashSet<string> ReadOnlyTelegrams() => readOnlyTelegrams ??= catalog.JobNames().Where(JobRules.IsReadOnlyJob)
         .Select(job => decoder.RequestFor(job)).OfType<byte[]>()
         .Select(Convert.ToHexString).ToHashSet();
 
@@ -122,7 +122,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         var jobs = new JsonArray();
         foreach (string name in names)
         {
-            jobs.Add(new JsonObject { ["name"] = name, ["read_only"] = Results.IsReadOnlyJob(name) });
+            jobs.Add(new JsonObject { ["name"] = name, ["read_only"] = JobRules.IsReadOnlyJob(name) });
         }
         return new JsonObject { ["sgbd"] = catalog.SgbdFile, ["count"] = names.Count, ["jobs"] = jobs };
     }
@@ -134,7 +134,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         return new JsonObject
         {
             ["job"] = job,
-            ["read_only"] = Results.IsReadOnlyJob(job),
+            ["read_only"] = JobRules.IsReadOnlyJob(job),
             ["comments"] = Sets("_JOBCOMMENTS"),
             ["arguments"] = Sets("_ARGUMENTS"),
             ["results"] = Sets("_RESULTS"),
@@ -156,11 +156,11 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(metadata) };
         }
         catalog.RequireJobs([job]);
-        if (!allowWrite && !Results.IsReadOnlyJob(job))
+        if (!allowWrite && !JobRules.IsReadOnlyJob(job))
         {
             throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; pass allow_write to run it");
         }
-        if (!Results.IsReadOnlyJob(job))
+        if (!JobRules.IsReadOnlyJob(job))
         {
             Audit("job.run", new JsonObject { ["job"] = job, ["args"] = args });
         }
@@ -244,7 +244,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             throw new FelkodException("bad_request", "jobs is empty");
         }
         catalog.RequireJobs(jobs.Concat(slowJobs));
-        var writeJobs = jobs.Concat(slowJobs).Where(job => !Results.IsReadOnlyJob(job)).ToList();
+        var writeJobs = jobs.Concat(slowJobs).Where(job => !JobRules.IsReadOnlyJob(job)).ToList();
         if (writeJobs.Count > 0)
         {
             throw new FelkodException("write_not_allowed", $"logging only runs read-only jobs: {string.Join(", ", writeJobs)}");
@@ -302,7 +302,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
     async Task<JsonNode?> Bench(string job, int n, bool native, int gapMs)
     {
         catalog.RequireJobs([job]);
-        if (!Results.IsReadOnlyJob(job))
+        if (!JobRules.IsReadOnlyJob(job))
         {
             throw new FelkodException("write_not_allowed", $"bench only runs read-only jobs: {job}");
         }
