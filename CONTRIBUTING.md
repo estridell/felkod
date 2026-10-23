@@ -6,7 +6,8 @@ them. Do not attach BMW software, SGBDs, firmware dumps or other proprietary fil
 
 For changes, branch from `main` and open a pull request. Follow the existing C# and Python style,
 include regression coverage for behavior changes, and run the checks in README's Development section.
-Regenerate `skill/SKILL.md` with `python3 skill/generate.py` when changing CLI help.
+Regenerate `skill/SKILL.md` with `python3 skill/generate.py` when changing CLI help; it needs
+Python 3.14, the version CI checks it with, because argparse formats help differently between versions.
 
 Keep tests hardware-free using the upstream test SGBDs or synthetic data. State separately what was
 tested on a car, which ECU/software version was used, and whether the native transport was involved.

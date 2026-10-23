@@ -7,15 +7,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "cli" / "felkod"
+# argparse wraps and lays out help differently between Python versions, so SKILL.md is only
+# reproducible on one; CI regenerates it with this version and fails on any difference.
+PYTHON = (3, 14)
 COMMANDS = ["status", "daemon", "ident", "faults", "jobs", "run", "read", "log", "bench", "ds2", "sessions", "session"]
 
 
 def help_text(*args):
     return subprocess.run([sys.executable, str(CLI), *args, "--help"], capture_output=True, text=True, check=True,
-                          env={**os.environ, "COLUMNS": "80"}).stdout
+                          env={**os.environ, "COLUMNS": "80", "PYTHON_COLORS": "0"}).stdout
 
 
 def main():
+    if sys.version_info[:2] != PYTHON:
+        sys.exit(f"generate.py needs Python {PYTHON[0]}.{PYTHON[1]} (this is {sys.version.split()[0]}): "
+                 "argparse formats help differently in other versions")
     parts = [
         "---",
         "name: felkod",

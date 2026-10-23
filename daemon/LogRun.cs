@@ -167,14 +167,16 @@ sealed class LogRun
 
     void Sample(Bus bus, string job, int sampleCycle, DateTime startedAt, double startedElapsed)
     {
+        long sampleStart = Stopwatch.GetTimestamp();
         var sw = Stopwatch.StartNew();
         var (sets, exchange) = nativeGapMs is int gap ? bus.RunJobNative(job, "", gap) : (bus.RunJob(job), null);
         Results.EnsureOkay(sets);
         if (exchange?.SentAt is DateTime sentAt)
         {
             // Stamp the actual final request, including time spent opening the port, decoding
-            // the request and retrying a corrupt exchange, rather than just adding the gap.
-            startedElapsed = Math.Round(startedElapsed + (sentAt - startedAt).TotalSeconds, 3);
+            // the request and retrying a corrupt exchange, rather than just adding the gap. The offset
+            // is monotonic, so a clock step during the sample can't move it; sentAt is only the wall time.
+            startedElapsed = Math.Round(startedElapsed + Stopwatch.GetElapsedTime(sampleStart, exchange.SentTimestamp).TotalSeconds, 3);
             startedAt = sentAt;
         }
         session.AddSample(startedAt, startedElapsed, sampleCycle, job, Math.Round(sw.Elapsed.TotalMilliseconds, 1), sets, exchange);

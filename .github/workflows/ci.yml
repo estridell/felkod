@@ -21,7 +21,7 @@ jobs:
           dotnet-version: '10.0.x'
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.14'
       - run: dotnet build -c Release daemon
       - run: dotnet build -c Release spike
       - run: dotnet run --project tests -c Release

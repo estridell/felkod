@@ -118,7 +118,7 @@ python3 skill/generate.py
 git diff --exit-code -- skill/SKILL.md
 ```
 
-These checks run in CI on Linux with .NET 10 and Python 3.12. They use upstream EdiabasLib's test
+These checks run in CI on Linux with .NET 10 and Python 3.14. They use upstream EdiabasLib's test
 SGBD, temporary session databases and a pseudo-terminal ECU; no BMW files, cable or car are required. They cover interpreter
 isolation, write guards, session persistence, concurrent log starts, CLI options and read-only SQL.
 They do not establish real-car transport behavior. Native DS2 still needs on-car validation before
