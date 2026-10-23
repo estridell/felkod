@@ -24,19 +24,23 @@ var signalHandlers = new[] { PosixSignal.SIGINT, PosixSignal.SIGTERM, PosixSigna
     }))
     .ToList();
 
-var catalog = new Catalog(config);
-var decoder = new SgbdDecoder(config);
-var bus = new Bus(config, decoder, catalog);
-var handlers = new Handlers(config, bus, catalog, decoder, shutdown.Set);
-handlers.WarmUp();
-var server = new RpcServer(config.SocketPath, handlers);
+Catalog catalog;
+Bus bus;
+RpcServer server;
+// e.g. no SGBD in the ECU path, or another felkodd on the socket: one line in felkodd.log, not a stack trace
 try
 {
+    catalog = new Catalog(config);
+    var decoder = new SgbdDecoder(config);
+    bus = new Bus(config, decoder, catalog);
+    var handlers = new Handlers(config, bus, catalog, decoder, shutdown.Set);
+    handlers.WarmUp();
+    server = new RpcServer(config.SocketPath, handlers);
     server.Start();
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"felkodd: {ex.Message}");
+    Console.Error.WriteLine($"felkodd: {ex.GetBaseException().Message}");
     return 1;
 }
 bus.Start();

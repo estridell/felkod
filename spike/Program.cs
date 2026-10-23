@@ -128,8 +128,9 @@ try
         {
             CheckWriteAllowed(Arg(1));
             var sets = RunJob(Arg(1), rest.Count > 2 ? rest[2] : "");
-            output["result_sets"] = sets;
+            // rejected results are zeros or garbage, never data
             EnsureOkay(sets);
+            output["result_sets"] = sets;
             break;
         }
         case "bench":

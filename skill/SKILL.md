@@ -14,9 +14,9 @@ usage: felkod [-h]
 felkod: diagnostics for a BMW E46 (Siemens MS43) over a K+DCAN cable.
 
 Talks to felkodd (the daemon that owns the cable) over a unix socket and starts it when needed.
-Every command prints one JSON object: {"ok": true, "data": ..., "warnings": [...]} or
+Commands print one JSON object: {"ok": true, "data": ..., "warnings": [...]} or
 {"ok": false, "error": {"code": ..., "message": ...}}. Exit status 0 = ok, 1 = error, 2 = usage.
-Stdlib only.
+Help and usage errors are plain text. Stdlib only.
 
 positional arguments:
   {status,daemon,ident,faults,jobs,run,read,log,bench,ds2,sessions,session}
@@ -59,7 +59,7 @@ options:
 ## felkod daemon
 
 ```
-usage: felkod daemon [-h] [--port PORT] [--sgbd SGBD]
+usage: felkod daemon [-h] [--port PORT] [--sgbd SGBD] [--ecu-path ECU_PATH]
                      [--job-timeout JOB_TIMEOUT]
                      {start,stop}
 
@@ -70,6 +70,8 @@ options:
   -h, --help            show this help message and exit
   --port PORT           serial device (default /dev/felkod-kline)
   --sgbd SGBD           SGBD to use (default ms430ds0)
+  --ecu-path ECU_PATH   directory with the SGBD files (default
+                        vendor/bmw/ediabas/ecu)
   --job-timeout JOB_TIMEOUT
                         seconds before a job counts as failed (default 15)
 ```
@@ -228,9 +230,10 @@ options:
 ```
 usage: felkod session [-h] [--limit LIMIT] {show,query} id [sql]
 
-Session database (SQLite, read-only here): samples(id, t, elapsed_s, cycle,
-job, ms); readings(sample_id, set_index, name, value, text, unit); events(id,
-t, elapsed_s, kind, job, detail); meta(key, value); raw(sample_id, request,
+Queries are SELECT or WITH only (no PRAGMA, ATTACH or writes). Session
+database (SQLite, read-only here): samples(id, t, elapsed_s, cycle, job, ms);
+readings(sample_id, set_index, name, value, text, unit); events(id, t,
+elapsed_s, kind, job, detail); meta(key, value); raw(sample_id, request,
 response, echo_ms, first_byte_ms, total_ms, waited_ms, retries) for native
 samples; view series(t, elapsed_s, job, set_index, name, value, text, unit). t
 is UTC ISO 8601 when the request was sent (native) or the job started
