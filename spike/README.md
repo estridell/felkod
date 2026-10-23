@@ -5,6 +5,7 @@ It compiles EdiabasLib's sources (submodule in `vendor/ediabaslib`) for `net10.0
 only targets Windows and Android. Output is JSON; raw EDIABAS/IFH traces land in `traces/<timestamp>/`.
 
 ```
+cd spike
 dotnet build -c Release
 alias spike=./bin/Release/net10.0/felkod-spike
 spike jobs                          # offline: list MS430DS0.prg jobs
@@ -15,8 +16,8 @@ spike log                           # loop until Ctrl+C, one JSON line per job i
 ```
 
 Options: `--port` (default `/dev/felkod-kline`), `--sgbd` (default `ms430ds0`), `--ecu-path`, `--trace-dir`,
-`--job-timeout` (seconds, default 15), `--allow-write yes` (needed for any job that is not read-only:
-`STEUERN_*`, `*_LOESCHEN`, `*_PROGRAMMIEREN`, ...). A job whose `JOB_STATUS` is not `OKAY` (the ECU
+`--job-timeout` (seconds, default 15), `--allow-write yes` (needed for any job that is not read-only by
+the daemon's rule in `daemon/JobRules.cs`: `STEUERN_*`, `*_LOESCHEN`, `*_PROGRAMMIEREN`, ...). A job whose `JOB_STATUS` is not `OKAY` (the ECU
 rejected it) counts as failed and its values are never reported.
 
 Log options: `--jobs` (comma list, default `STATUS_MESSWERTEBLOCK`), `--slow-jobs` (run every
@@ -27,10 +28,13 @@ a fresh connection is probed every second (`still_down` every 10 s), and logging
 logging continues. Stop with Ctrl+C, or `kill -TERM <pid>` for a background run; the summary is
 printed and traces are flushed. A second signal exits immediately.
 
-## One-time setup (done 2026-10-21)
+## One-time setup
 
-- `dotnet-sdk` (10.0) installed, user added to `uucp` (log out and in once)
-- `99-felkod.rules` copied to `/etc/udev/rules.d/`: 1 ms FTDI latency, `/dev/felkod-kline` symlink
+- .NET 10 SDK; your user in the serial port's group (`uucp` on Arch, `dialout` on Debian/Ubuntu; log in again)
+- `99-felkod.rules` copied to `/etc/udev/rules.d/`, then `sudo udevadm control --reload-rules` and replug
+  the cable: 1 ms FTDI latency, `/dev/felkod-kline` symlink
+
+The spike and felkodd both need the cable to themselves: `felkod daemon stop` before running the spike.
 
 ## In the car
 

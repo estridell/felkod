@@ -1,5 +1,5 @@
-# BMW Standard Tools files from the cable kit: proprietary, ~1.4 GB. Kept locally, never committed.
-# See vendor/README.md for what lives there and how to repopulate it.
+# BMW files from your own EDIABAS/INPA installation: proprietary, kept locally, never committed.
+# See vendor/README.md.
 vendor/bmw/
 
 # Python

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  hardware-free:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      # skill/generate.py needs this version: argparse formats help differently in others
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: dotnet build -c Release daemon
+      - run: dotnet build -c Release spike
+      - run: dotnet run --project tests -c Release
+      - run: python3 -m unittest discover -s tests -v
+      - name: Check that skill/SKILL.md matches the CLI's help
+        run: |
+          python3 skill/generate.py
+          git diff --exit-code -- skill/SKILL.md

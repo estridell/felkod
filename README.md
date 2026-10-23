@@ -38,14 +38,19 @@ Use at your own risk. felkod only reads by default; anything that changes the ca
 
 ```
 git clone --recurse-submodules <this repo> && cd felkod
-# copy your EDIABAS Ecu folder to vendor/bmw/ediabas/ecu (or pass --ecu-path to felkodd)
+# copy your EDIABAS Ecu folder to vendor/bmw/ediabas/ecu (or use felkod daemon start --ecu-path DIR)
 dotnet build -c Release daemon
-ln -s "$PWD/cli/felkod" ~/.local/bin/felkod
+mkdir -p ~/.local/bin && ln -s "$PWD/cli/felkod" ~/.local/bin/felkod
 ```
 
+In a checkout made without `--recurse-submodules`, run `git submodule update --init` first. A daemon
+started with `felkod daemon start --ecu-path DIR` (or `--port`, `--sgbd`) keeps those settings until
+`felkod daemon stop`; a daemon started on first use has the defaults.
+
 Linux serial access: install `spike/99-felkod.rules` into `/etc/udev/rules.d/` (1 ms FTDI latency timer,
-`/dev/felkod-kline` symlink) and add your user to the group that owns the port (`uucp` on Arch,
-`dialout` on Debian/Ubuntu).
+`/dev/felkod-kline` symlink; the port keeps the distribution's serial group), run
+`sudo udevadm control --reload-rules`, replug the cable, and add your user to that group (`uucp` on Arch,
+`dialout` on Debian/Ubuntu; log in again afterwards).
 
 ## Use
 
@@ -61,9 +66,9 @@ felkod sessions
 felkod session query <id> "SELECT t, name, value, unit FROM series WHERE name LIKE 'STAT_MOTORDREHZAHL%'"
 ```
 
-Every command prints one JSON object: `{"ok": true, "data": ..., "warnings": [...]}` or
+Commands print one JSON object: `{"ok": true, "data": ..., "warnings": [...]}` or
 `{"ok": false, "error": {"code": ..., "message": ...}}`; exit status 0 = ok, 1 = error, 2 = usage.
-The daemon (`felkodd`) starts on first use and owns the cable; a faults read while a log runs is
+Help and usage errors are plain text. The daemon (`felkodd`) starts on first use and owns the cable; a faults read while a log runs is
 interleaved between log steps. `skill/SKILL.md` is the full CLI reference for agents, generated from
 `--help`.
 
@@ -74,16 +79,39 @@ fixed 100 ms regeneration time. Raw telegrams are kept in the session's `raw` ta
 again with `felkod ds2 decode`.
 
 Sessions live in `~/.local/share/felkod/sessions/<id>/` (`session.sqlite`, `meta.json`, raw telegram
-trace `ifh.trc`); `felkod session show <id>` lists the tables.
+trace `ifh.trc`); `felkod session show <id>` lists the tables. `XDG_DATA_HOME` moves the data
+directory. `felkod session query` runs `SELECT`/`WITH` statements only; `PRAGMA`, `ATTACH` and writes
+are refused. Sessions and traces can contain the car's VIN.
 
 ## Safety
 
-- Jobs that are not read-only (`STEUERN_*`, `*_LOESCHEN`, `*_PROGRAMMIEREN`, ...) need `--allow-write`.
+- Read-only jobs are `STATUS_*`, `LESEN_*`, `*_LESEN`, `IDENT`, `IDENT_AIF`, `INFO`, `ECU_CONFIG` and
+  EDIABAS's metadata jobs (`_JOBS`, `_TABLE`, ...), by name. Every other job (`STEUERN_*`, `*_LOESCHEN`,
+  `*_PROGRAMMIEREN`, other `_*` jobs, ...) needs `--allow-write`.
 - `faults clear` needs `--confirm`, refuses below 11.5 V battery, and saves the faults to
   `~/.local/share/felkod/audit.jsonl` before clearing; every write is recorded there.
 - `ds2 raw` sends only telegrams that a read-only SGBD job sends, unless `--allow-write`.
-- Replies are only decoded when their DS2 status is OK by BMW's own status table and their length
-  matches earlier good replies, so a rejected or truncated reply never becomes data.
+- Replies to single-telegram jobs are only decoded when their DS2 status is OK by BMW's own status table
+  and their length matches earlier good replies to the same request, so a rejected or truncated reply
+  never becomes data. The expected length is learned from the first good reply, so a short first reply
+  is not caught.
+- The daemon's socket is accessible only to its owner.
+
+## Development
+
+The checks CI runs, without a car, a cable or BMW files (they use EdiabasLib's own test SGBDs and a
+pseudo-terminal as the ECU):
+
+```
+dotnet build -c Release daemon
+dotnet build -c Release spike
+dotnet run --project tests -c Release
+python3 -m unittest discover -s tests -v
+python3 skill/generate.py && git diff --exit-code -- skill/SKILL.md
+```
+
+`skill/generate.py` needs Python 3.14, the version CI uses: argparse formats help differently in other
+versions. See `CONTRIBUTING.md`.
 
 ## Layout
 
@@ -92,6 +120,7 @@ trace `ifh.trc`); `felkod session show <id>` lists the tables.
 - `cli/felkod` — the CLI (Python, stdlib only)
 - `skill/` — `SKILL.md` for agents, generated from the CLI's `--help` by `skill/generate.py`
 - `spike/` — the Phase 0 test program, and the udev rule
+- `tests/` — the hardware-free checks (daemon in C#, CLI and daemon together in Python)
 - `vendor/ediabaslib/` — EdiabasLib (git submodule, GPLv3)
 - `vendor/bmw/` — your BMW SGBD files (not in the repo; see `vendor/README.md`)
 
