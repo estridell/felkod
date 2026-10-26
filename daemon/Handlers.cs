@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -6,7 +5,7 @@ namespace Felkod.Daemon;
 
 // The daemon's methods. Everything that talks to the ECU goes through the bus thread;
 // metadata comes from the offline catalog. Output is the SGBD's own names, values and units.
-sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decoder, Action requestShutdown)
+sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShutdown)
 {
     // BMW's regeneration time for MS43 DS2; the native default until a shorter gap is measured safe.
     const int DefaultGapMs = 100;
@@ -30,7 +29,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
     public void WarmUp() => ReadOnlyTelegrams();
 
     HashSet<string> ReadOnlyTelegrams() => readOnlyTelegrams ??= catalog.JobNames().Where(JobRules.IsReadOnlyJob)
-        .Select(job => decoder.RequestFor(job)).OfType<byte[]>()
+        .Select(job => catalog.RequestFor(job)).OfType<byte[]>()
         .Select(Convert.ToHexString).ToHashSet();
 
     async Task<JsonNode?> Dispatch(string method, JsonObject p, JsonArray warnings) => method switch
@@ -40,7 +39,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         "jobs.list" => JobsList(),
         "jobs.describe" => JobsDescribe(Str(p, "job")),
         "job.run" => await JobRun(Str(p, "job"), OptStr(p, "args") ?? "", OptBool(p, "allow_write"), OptBool(p, "native"), Gap(p)),
-        "faults.read" => await FaultsRead(),
+        "faults.read" => await bus.Submit(() => FaultList(bus.RunJob("FS_LESEN"))),
         "faults.clear" => await FaultsClear(OptBool(p, "confirm")),
         "log.start" => await LogStart(p, warnings),
         "bench" => await Bench(Str(p, "job"), p["n"]?.GetValue<int>() ?? 20, OptBool(p, "native"), Gap(p)),
@@ -122,19 +121,17 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
     async Task<JsonNode?> Ident()
     {
         var sets = (JsonArray)(await bus.Submit(() => bus.RunJob("IDENT")))!;
-        Results.EnsureOkay(sets);
         return new JsonObject { ["job"] = "IDENT", ["sets"] = Results.ValueSets(sets) };
     }
 
     JsonObject JobsList()
     {
-        var names = catalog.JobNames().OrderBy(name => name, StringComparer.Ordinal).ToList();
         var jobs = new JsonArray();
-        foreach (string name in names)
+        foreach (string name in catalog.JobNames().OrderBy(name => name, StringComparer.Ordinal))
         {
             jobs.Add(new JsonObject { ["name"] = name, ["read_only"] = JobRules.IsReadOnlyJob(name) });
         }
-        return new JsonObject { ["sgbd"] = catalog.SgbdFile, ["count"] = names.Count, ["jobs"] = jobs };
+        return new JsonObject { ["sgbd"] = catalog.SgbdFile, ["count"] = jobs.Count, ["jobs"] = jobs };
     }
 
     JsonObject JobsDescribe(string job)
@@ -160,35 +157,25 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(metadata) };
         }
         catalog.RequireJobs([job]);
-        if (!allowWrite && !JobRules.IsReadOnlyJob(job))
+        bool readOnly = JobRules.IsReadOnlyJob(job);
+        if (!allowWrite && !readOnly)
         {
             throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; pass allow_write to run it");
         }
-        if (!JobRules.IsReadOnlyJob(job))
+        // native resends a request after a garbled reply, which a job that changes the car must not get
+        if (native && !readOnly)
         {
-            // native resends a request after a garbled reply, which a job that changes the car must not get
-            if (native)
-            {
-                throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; native only runs read-only jobs");
-            }
+            throw new FelkodException("write_not_allowed", $"{job} is not a read-only job; native only runs read-only jobs");
         }
         var sets = (JsonArray)(await bus.Submit(() =>
         {
-            if (!JobRules.IsReadOnlyJob(job))
+            if (!readOnly)
             {
                 Audit("job.run", new JsonObject { ["job"] = job, ["args"] = args });
             }
             return native ? bus.RunJobNative(job, args, gapMs).Sets : bus.RunJob(job, args);
         }))!;
-        Results.EnsureOkay(sets);
         return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(sets) };
-    }
-
-    async Task<JsonNode?> FaultsRead()
-    {
-        var sets = (JsonArray)(await bus.Submit(() => bus.RunJob("FS_LESEN")))!;
-        Results.EnsureOkay(sets);
-        return FaultList(sets);
     }
 
     // FS_LESEN returns one result set per stored fault, then a final set with only JOB_STATUS.
@@ -216,7 +203,6 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         return await bus.Submit(() =>
         {
             var ubattSets = bus.RunJob("STATUS_UBATT");
-            Results.EnsureOkay(ubattSets);
             double ubatt = ubattSets[1]!["STAT_UBATT_WERT"]!.GetValue<double>();
             if (ubatt < MinWriteVoltage)
             {
@@ -225,13 +211,11 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
             // The faults are saved to the audit log before the clear is sent, so clearing never loses them,
             // even if the clear's reply is lost.
             var before = bus.RunJob("FS_LESEN");
-            Results.EnsureOkay(before);
             var faults = FaultList(before);
             Audit("faults.clear", new JsonObject { ["stage"] = "sending", ["ubatt_v"] = ubatt, ["faults_before"] = faults.DeepClone() });
             try
             {
-                var cleared = bus.RunJob("FS_LOESCHEN");
-                Results.EnsureOkay(cleared);
+                bus.RunJob("FS_LOESCHEN");
             }
             catch (Exception ex)
             {
@@ -289,7 +273,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         meta["native_gap_ms"] = nativeGapMs;
         if (nativeGapMs != null)
         {
-            var notNative = jobs.Concat(slowJobs).Where(job => decoder.RequestFor(job) == null).ToList();
+            var notNative = jobs.Concat(slowJobs).Where(job => catalog.RequestFor(job) == null).ToList();
             if (notNative.Count > 0)
             {
                 warnings.Add($"not single-telegram jobs, logged through EdiabasLib: {string.Join(", ", notNative)}");
@@ -331,7 +315,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         {
             throw new FelkodException("bad_request", "bench needs n >= 2");
         }
-        if (native && decoder.RequestFor(job) == null)
+        if (native && catalog.RequestFor(job) == null)
         {
             throw new FelkodException("not_native", $"{job} does not send exactly one telegram; bench it without native");
         }
@@ -359,8 +343,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
-                    var (sets, exchange) = native ? bus.RunJobNative(job, "", gapMs) : (bus.RunJob(job), null);
-                    Results.EnsureOkay(sets);
+                    var (_, exchange) = native ? bus.RunJobNative(job, "", gapMs) : (bus.RunJob(job), null);
                     totals.Add(sw.Elapsed.TotalMilliseconds);
                     linkFailuresInARow = 0;
                     if (exchange != null)
@@ -418,7 +401,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
     JsonObject Ds2Request(string job, string args)
     {
         catalog.RequireJobs([job]);
-        var request = decoder.RequestFor(job, args);
+        var request = catalog.RequestFor(job, args);
         return new JsonObject
         {
             ["job"] = job,
@@ -431,7 +414,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
     JsonObject Ds2Decode(string job, string args, string responseHex)
     {
         catalog.RequireJobs([job]);
-        var request = decoder.RequestFor(job, args)
+        var request = catalog.RequestFor(job, args)
             ?? throw new FelkodException("not_native", $"{job} does not send exactly one telegram");
         var response = Hex(responseHex);
         // The same checks a live reply gets: framing, BMW's status and known length, then job status.
@@ -442,7 +425,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
                 $"not a complete DS2 reply from address {request[0]:X2} (length byte, checksum and address must match)");
         }
         bus.CheckReply(request, response);
-        var sets = decoder.Decode(job, args, request, response)
+        var sets = catalog.Decode(job, args, request, response)
             ?? throw new FelkodException("decode_failed", $"{job} could not decode that reply");
         Results.EnsureOkay(sets);
         return new JsonObject { ["job"] = job, ["args"] = args, ["sets"] = Results.ValueSets(sets) };
@@ -460,13 +443,10 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, SgbdDecoder decod
         {
             throw new FelkodException("bad_request", $"not a DS2 telegram: {Convert.ToHexString(request)}");
         }
-        if (!allowWrite)
+        if (!allowWrite && !ReadOnlyTelegrams().Contains(Convert.ToHexString(request)))
         {
-            if (!ReadOnlyTelegrams().Contains(Convert.ToHexString(request)))
-            {
-                throw new FelkodException("write_not_allowed",
-                    "not a telegram any read-only SGBD job sends; pass allow_write to send it anyway");
-            }
+            throw new FelkodException("write_not_allowed",
+                "not a telegram any read-only SGBD job sends; pass allow_write to send it anyway");
         }
         return await bus.Submit(() =>
         {

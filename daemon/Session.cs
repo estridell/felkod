@@ -60,7 +60,10 @@ sealed class Session : IDisposable
         try
         {
             db.Open();
-            Exec(db, Schema);
+            using (var schema = Command(db, Schema))
+            {
+                schema.ExecuteNonQuery();
+            }
             meta["id"] = id;
             var session = new Session(id, dir, db, meta);
             foreach (var (key, value) in meta.ToList())
@@ -118,22 +121,24 @@ sealed class Session : IDisposable
         }
     }
 
-    static void Exec(SqliteConnection db, string sql)
+    static SqliteCommand Command(SqliteConnection db, string sql, params (string Name, object? Value)[] parameters)
     {
-        using var cmd = db.CreateCommand();
+        var cmd = db.CreateCommand();
         cmd.CommandText = sql;
-        cmd.ExecuteNonQuery();
+        foreach (var (name, value) in parameters)
+        {
+            cmd.Parameters.AddWithValue(name, value ?? DBNull.Value);
+        }
+        return cmd;
     }
 
     public void SetMeta(string key, JsonNode? value)
     {
         meta[key] = value?.DeepClone();
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = "INSERT INTO meta (key, value) VALUES ($k, $v) ON CONFLICT (key) DO UPDATE SET value = excluded.value";
-        cmd.Parameters.AddWithValue("$k", key);
         // every value as JSON text, so "123" (a note) and 123 (a number) stay distinguishable
-        object stored = value != null ? value.ToJsonString() : DBNull.Value;
-        cmd.Parameters.AddWithValue("$v", stored);
+        using var cmd = Command(db,
+            "INSERT INTO meta (key, value) VALUES ($k, $v) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            ("$k", key), ("$v", value?.ToJsonString()));
         cmd.ExecuteNonQuery();
         // write-then-rename, so a reader (felkod sessions) never sees a half-written file
         File.WriteAllText(metaPath + ".tmp", meta.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
@@ -143,17 +148,13 @@ sealed class Session : IDisposable
     public void AddSample(DateTime t, double elapsed, int cycle, string job, double ms, JsonArray sets, Ds2Exchange? exchange = null)
     {
         using var tx = db.BeginTransaction();
-        using var sample = db.CreateCommand();
-        sample.CommandText = "INSERT INTO samples (t, elapsed_s, cycle, job, ms) VALUES ($t, $e, $c, $j, $ms) RETURNING id";
-        sample.Parameters.AddWithValue("$t", t.ToString("o"));
-        sample.Parameters.AddWithValue("$e", elapsed);
-        sample.Parameters.AddWithValue("$c", cycle);
-        sample.Parameters.AddWithValue("$j", job);
-        sample.Parameters.AddWithValue("$ms", ms);
+        using var sample = Command(db,
+            "INSERT INTO samples (t, elapsed_s, cycle, job, ms) VALUES ($t, $e, $c, $j, $ms) RETURNING id",
+            ("$t", t.ToString("o")), ("$e", elapsed), ("$c", cycle), ("$j", job), ("$ms", ms));
         long id = (long)sample.ExecuteScalar()!;
 
-        using var reading = db.CreateCommand();
-        reading.CommandText = "INSERT INTO readings (sample_id, set_index, name, value, text, unit) VALUES ($id, $si, $n, $v, $x, $u)";
+        using var reading = Command(db,
+            "INSERT INTO readings (sample_id, set_index, name, value, text, unit) VALUES ($id, $si, $n, $v, $x, $u)");
         var pName = reading.Parameters.Add("$n", SqliteType.Text);
         var pValue = reading.Parameters.Add("$v", SqliteType.Real);
         var pText = reading.Parameters.Add("$x", SqliteType.Text);
@@ -182,17 +183,12 @@ sealed class Session : IDisposable
         }
         if (exchange != null)
         {
-            using var raw = db.CreateCommand();
-            raw.CommandText = "INSERT INTO raw (sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms, retries) "
-                + "VALUES ($id, $rq, $rs, $e, $f, $t, $w, $r)";
-            raw.Parameters.AddWithValue("$id", id);
-            raw.Parameters.AddWithValue("$rq", Convert.ToHexString(exchange.Request));
-            raw.Parameters.AddWithValue("$rs", Convert.ToHexString(exchange.Response));
-            raw.Parameters.AddWithValue("$e", exchange.EchoMs);
-            raw.Parameters.AddWithValue("$f", exchange.FirstByteMs);
-            raw.Parameters.AddWithValue("$t", exchange.TotalMs);
-            raw.Parameters.AddWithValue("$w", exchange.WaitedMs);
-            raw.Parameters.AddWithValue("$r", exchange.Retries);
+            using var raw = Command(db,
+                "INSERT INTO raw (sample_id, request, response, echo_ms, first_byte_ms, total_ms, waited_ms, retries) "
+                    + "VALUES ($id, $rq, $rs, $e, $f, $t, $w, $r)",
+                ("$id", id), ("$rq", Convert.ToHexString(exchange.Request)), ("$rs", Convert.ToHexString(exchange.Response)),
+                ("$e", exchange.EchoMs), ("$f", exchange.FirstByteMs), ("$t", exchange.TotalMs),
+                ("$w", exchange.WaitedMs), ("$r", exchange.Retries));
             raw.ExecuteNonQuery();
         }
         tx.Commit();
@@ -200,13 +196,9 @@ sealed class Session : IDisposable
 
     public void AddEvent(DateTime t, double elapsed, string kind, string? job = null, string? detail = null)
     {
-        using var cmd = db.CreateCommand();
-        cmd.CommandText = "INSERT INTO events (t, elapsed_s, kind, job, detail) VALUES ($t, $e, $k, $j, $d)";
-        cmd.Parameters.AddWithValue("$t", t.ToString("o"));
-        cmd.Parameters.AddWithValue("$e", elapsed);
-        cmd.Parameters.AddWithValue("$k", kind);
-        cmd.Parameters.AddWithValue("$j", (object?)job ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$d", (object?)detail ?? DBNull.Value);
+        using var cmd = Command(db,
+            "INSERT INTO events (t, elapsed_s, kind, job, detail) VALUES ($t, $e, $k, $j, $d)",
+            ("$t", t.ToString("o")), ("$e", elapsed), ("$k", kind), ("$j", job), ("$d", detail));
         cmd.ExecuteNonQuery();
     }
 

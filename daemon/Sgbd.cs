@@ -10,7 +10,7 @@ namespace Felkod.Daemon;
 // holds Gate (a new instance binds the registers to itself), and every later use of an instance (jobs,
 // dispose) goes through Use, which holds Gate and binds the registers back to it first. The binding reaches into
 // EdiabasLib's private RegisterList: check it when updating the submodule.
-// Lock order: an object's own lock (decoder, catalog) first, then Gate.
+// Lock order: the catalog's own lock first, then Gate.
 static class Sgbd
 {
     public static readonly object Gate = new();

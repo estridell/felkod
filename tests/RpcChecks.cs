@@ -1,7 +1,9 @@
 using System.Net.Sockets;
+using System.Runtime.Versioning;
 using System.Text.Json.Nodes;
 using Felkod.Daemon;
 
+[SupportedOSPlatform("linux")]
 static class RpcChecks
 {
     public static async Task Run(Config config, Handlers handlers, Action<bool, string> check)
@@ -11,6 +13,7 @@ static class RpcChecks
         server.Start();
         try
         {
+            check(File.GetUnixFileMode(path) == (UnixFileMode.UserRead | UnixFileMode.UserWrite), "socket mode 0600");
             new RpcServer(path, handlers).Stop();
             check(File.Exists(path), "stopping an unstarted server preserves the live socket");
             var rejected = new RpcServer(path, handlers);
@@ -50,6 +53,7 @@ static class RpcChecks
                 "RPC connection survives malformed requests");
         }
         finally { server.Stop(); }
+        check(!File.Exists(path), "socket removed at stop");
 
         File.WriteAllText(path, "preserve this file");
         var fileServer = new RpcServer(path, handlers);

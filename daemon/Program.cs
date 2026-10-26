@@ -31,9 +31,8 @@ try
     Directory.CreateDirectory(config.DataDir);
     Directory.CreateDirectory(config.SessionsDir);
     catalog = new Catalog(config);
-    var decoder = new SgbdDecoder(config);
-    bus = new Bus(config, decoder, catalog);
-    var handlers = new Handlers(config, bus, catalog, decoder, shutdown.Set);
+    bus = new Bus(config, catalog);
+    var handlers = new Handlers(config, bus, catalog, shutdown.Set);
     handlers.WarmUp();
     server = new RpcServer(config.SocketPath, handlers);
     server.Start();

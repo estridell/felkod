@@ -24,7 +24,6 @@ jobs:
         with:
           python-version: '3.14'
       - run: dotnet build -c Release daemon
-      - run: dotnet build -c Release spike
       - run: dotnet run --project tests -c Release
       - run: python3 -m unittest discover -s tests -v
       - name: Check that skill/SKILL.md matches the CLI's help

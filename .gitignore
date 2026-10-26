@@ -19,7 +19,7 @@ sessions/
 *.sqlite-wal
 *.sqlite-shm
 
-# Spike traces (raw EDIABAS/IFH logs)
+# Legacy prototype traces (raw EDIABAS/IFH logs)
 spike/traces/
 
 # Developer tools: a separate (private) git repo checked out here

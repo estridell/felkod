@@ -1,4 +1,3 @@
-using System.Text.Json.Nodes;
 using EdiabasLib;
 
 namespace Felkod.Daemon;
@@ -16,7 +15,7 @@ sealed class DecodeInterface : EdInterfaceBase
     bool capturing;
     byte[]? expectedRequest;
     byte[]? pendingResponse;
-    public string? Problem { get; private set; }
+    public bool Failed { get; private set; }
 
     public void Capture()
     {
@@ -24,7 +23,7 @@ sealed class DecodeInterface : EdInterfaceBase
         Captured.Clear();
         expectedRequest = null;
         pendingResponse = null;
-        Problem = null;
+        Failed = false;
     }
 
     public void Answer(byte[] request, byte[] response)
@@ -32,7 +31,7 @@ sealed class DecodeInterface : EdInterfaceBase
         capturing = false;
         expectedRequest = request;
         pendingResponse = response;
-        Problem = null;
+        Failed = false;
     }
 
     public override bool TransmitData(byte[] sendData, out byte[] receiveData)
@@ -56,15 +55,9 @@ sealed class DecodeInterface : EdInterfaceBase
             receiveData = dummy;
             return true;
         }
-        if (pendingResponse == null)
+        if (pendingResponse == null || !request.AsSpan().SequenceEqual(expectedRequest))
         {
-            Problem = "job sends more than one telegram";
-            Ediabas.SetError(EdiabasNet.ErrorCodes.EDIABAS_IFH_0009);
-            return false;
-        }
-        if (!request.AsSpan().SequenceEqual(expectedRequest))
-        {
-            Problem = $"job sent {Convert.ToHexString(request)}, expected {Convert.ToHexString(expectedRequest!)}";
+            Failed = true;
             Ediabas.SetError(EdiabasNet.ErrorCodes.EDIABAS_IFH_0009);
             return false;
         }
@@ -74,11 +67,6 @@ sealed class DecodeInterface : EdInterfaceBase
     }
 
     public override bool IsValidInterfaceName(string name) => name == "DECODE";
-    public override bool InterfaceConnect()
-    {
-        base.InterfaceConnect();
-        return true;
-    }
     public override bool InterfaceReset() => true;
     public override bool InterfaceBoot() => true;
     public override bool TransmitFrequent(byte[] sendData) => false;
@@ -113,93 +101,4 @@ sealed class DecodeInterface : EdInterfaceBase
     public override void SwitchSiRelais(uint time) { }
     public override bool Connected => true;
     public override bool IsEcuConnected => true;
-}
-
-// Runs SGBD jobs against DecodeInterface: learns the single telegram a job sends, then decodes
-// replies captured by Ds2Port. Jobs that send more than one telegram are reported as not native.
-sealed class SgbdDecoder
-{
-    readonly EdiabasNet ediabas;
-    readonly DecodeInterface decode = new();
-    // Args-free jobs only (the logging hot path). Args come from RPC callers, so caching them would grow without bound.
-    readonly Dictionary<string, byte[]?> requests = new();
-    // Used by the bus thread (native logging) and by RPC threads (offline decode).
-    readonly object gate = new();
-
-    public SgbdDecoder(Config config)
-    {
-        lock (Sgbd.Gate)
-        {
-            ediabas = new EdiabasNet();
-            ediabas.EdInterfaceClass = decode;
-            ediabas.SetConfigProperty("EcuPath", config.EcuPath);
-            ediabas.SetConfigProperty("ApiTrace", "0");
-            ediabas.SetConfigProperty("IfhTrace", "0");
-            ediabas.ResolveSgbdFile(config.Sgbd);
-        }
-    }
-
-    // The telegram a job sends, or null if it sends none or more than one (not usable natively).
-    public byte[]? RequestFor(string job, string args = "")
-    {
-        lock (gate)
-        {
-            return RequestForLocked(job, args);
-        }
-    }
-
-    byte[]? RequestForLocked(string job, string args)
-    {
-        if (args == "" && requests.TryGetValue(job, out var known))
-        {
-            return known;
-        }
-        decode.Capture();
-        Execute(job, args);
-        byte[]? request = decode.Captured.Count == 1 ? decode.Captured[0] : null;
-        if (args == "")
-        {
-            requests[job] = request;
-        }
-        return request;
-    }
-
-    public void MarkNotNative(string job, string args = "")
-    {
-        lock (gate)
-        {
-            if (args == "")
-            {
-                requests[job] = null;
-            }
-        }
-    }
-
-    // Decodes a captured reply into the job's result sets; null if the job did not fit it
-    // (e.g. it wanted another telegram). Whether that makes the job not native is the caller's call.
-    public JsonArray? Decode(string job, string args, byte[] request, byte[] response)
-    {
-        lock (gate)
-        {
-            decode.Answer(request, response);
-            bool ok = Execute(job, args);
-            return ok && decode.Problem == null ? Results.ToJson(ediabas.ResultSets) : null;
-        }
-    }
-
-    bool Execute(string job, string args) => Sgbd.Use(ediabas, () =>
-    {
-        ediabas.ArgString = args;
-        ediabas.ArgBinaryStd = null;
-        ediabas.ResultsRequests = "";
-        try
-        {
-            ediabas.ExecuteJob(job);
-            return true;
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-    });
 }

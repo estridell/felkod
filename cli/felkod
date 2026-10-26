@@ -87,8 +87,8 @@ def start_daemon(extra_args=()):
     raise Failure("daemon_start_failed", f"felkodd did not come up; see {data_dir() / 'felkodd.log'}")
 
 
-def call(method, params=None, autostart=True):
-    """Sends one request; returns the daemon's response object (ok/data/warnings or ok/error)."""
+def data(method, params=None, *, autostart=True):
+    """Calls the daemon and returns its data, raising Failure on an error response."""
     if autostart:
         start_daemon()
     request = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
@@ -125,8 +125,10 @@ def call(method, params=None, autostart=True):
     problem = response_problem(response)
     if problem:
         raise Failure("daemon_protocol", f"invalid response from felkodd: {problem}")
-    response.pop("id", None)
-    return response
+    if not response["ok"]:
+        raise Failure(response["error"]["code"], response["error"]["message"])
+    WARNINGS.extend(response.get("warnings", []))
+    return response["data"]
 
 
 def response_problem(response):
@@ -155,15 +157,6 @@ def json_loads(value):
         return value
 
     return json.loads(value, parse_float=number, parse_constant=number)
-
-
-def data(method, params=None, *, autostart=True):
-    """Calls the daemon and returns its data, raising Failure on an error response."""
-    response = call(method, params, autostart=autostart)
-    if not response["ok"]:
-        raise Failure(response["error"]["code"], response["error"]["message"])
-    WARNINGS.extend(response.get("warnings", []))
-    return response["data"]
 
 
 WARNINGS = []
@@ -284,14 +277,17 @@ def native_params(args):
     return params
 
 
+def start_log(args, jobs):
+    return data("log.start", {"jobs": jobs, "slow_jobs": jobs_arg(args.slow_jobs),
+                              "slow_every": args.slow_every, "duration_s": args.duration or 0, "note": args.note,
+                              **native_params(args)})
+
+
 def cmd_read(args):
     if args.duration is None:
         return {"results": [data("job.run", {"job": job, **native_params(args)}) for job in args.jobs]}
-    started = data("log.start", {"jobs": args.jobs, "slow_jobs": jobs_arg(args.slow_jobs),
-                                 "slow_every": args.slow_every, "duration_s": args.duration, "note": args.note,
-                                 **native_params(args)})
-    session_id = started["session_id"]
-    while (status := data("log.status", autostart=False)).get("session_id") == session_id:
+    session_id = start_log(args, args.jobs)["session_id"]
+    while data("log.status", autostart=False).get("session_id") == session_id:
         # Poll even for a long duration: another CLI can stop the session, and passing an
         # arbitrarily large finite --duration straight to sleep overflows on some platforms.
         time.sleep(min(args.duration, 0.2))
@@ -302,9 +298,7 @@ def cmd_log(args):
     if args.action == "start":
         if not args.jobs:
             raise Failure("bad_request", "log start needs --jobs")
-        return data("log.start", {"jobs": jobs_arg(args.jobs), "slow_jobs": jobs_arg(args.slow_jobs),
-                                  "slow_every": args.slow_every, "duration_s": args.duration or 0, "note": args.note,
-                                  **native_params(args)})
+        return start_log(args, jobs_arg(args.jobs))
     if args.action == "stop":
         return data("log.stop")
     return data("log.status")
@@ -495,23 +489,20 @@ def build_parser():
 
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     if getattr(args, "action", None) == "query" and not args.sql:
-        build_parser().error("session query needs SQL")
+        parser.error("session query needs SQL")
     try:
-        output = {"ok": True, "data": args.func(args), "warnings": WARNINGS}
-        code = 0
+        output = {"ok": True, "data": args.func(args)}
     except Failure as failure:
-        output = {"ok": False, "error": {"code": failure.code, "message": failure.message}, "warnings": WARNINGS}
-        code = 1
-    except sqlite3.Error as error:
-        output = {"ok": False, "error": {"code": "sql", "message": str(error)}, "warnings": WARNINGS}
-        code = 1
-    except OSError as error:  # e.g. the data directory or felkodd.log cannot be created
-        output = {"ok": False, "error": {"code": "io", "message": str(error)}, "warnings": WARNINGS}
-        code = 1
+        output = {"ok": False, "error": {"code": failure.code, "message": failure.message}}
+    except (sqlite3.Error, OSError) as error:
+        code = "sql" if isinstance(error, sqlite3.Error) else "io"
+        output = {"ok": False, "error": {"code": code, "message": str(error)}}
+    output["warnings"] = WARNINGS
     print(json.dumps(output, indent=2 if sys.stdout.isatty() else None, ensure_ascii=False))
-    return code
+    return 0 if output["ok"] else 1
 
 
 if __name__ == "__main__":
