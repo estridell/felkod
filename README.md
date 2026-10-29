@@ -37,7 +37,7 @@ Use at your own risk. felkod only reads by default; anything that changes the ca
 ## Setup
 
 ```
-git clone --recurse-submodules <this repo> && cd felkod
+git clone --recurse-submodules https://github.com/estridell/felkod.git && cd felkod
 # copy your EDIABAS Ecu folder to vendor/bmw/ediabas/ecu (or use felkod daemon start --ecu-path DIR)
 dotnet build -c Release daemon
 mkdir -p ~/.local/bin && ln -s "$PWD/cli/felkod" ~/.local/bin/felkod
