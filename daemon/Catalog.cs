@@ -26,6 +26,13 @@ sealed class Catalog
             ediabas.SetConfigProperty("IfhTrace", "0");
             // Skip init only for virtual metadata jobs; normal capture/replay still initializes.
             ediabas.NoInitForVJobs = true;
+            // A group file picks its variant by identifying the ECU on the car, which this hardware-free
+            // interpreter cannot do; EdiabasLib would only fail with a bare interface error.
+            if (ediabas.GetFileType(Path.Combine(config.EcuPath, config.Sgbd)) == 0)
+            {
+                throw new FelkodException("group_file",
+                    $"{config.Sgbd} is a group file (.grp), not an SGBD; pass the variant's SGBD (.prg) instead");
+            }
             ediabas.ResolveSgbdFile(config.Sgbd);
         }
         try

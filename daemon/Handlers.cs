@@ -121,7 +121,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
     async Task<JsonNode?> Ident()
     {
         var sets = (JsonArray)(await bus.Submit(() => bus.RunJob("IDENT")))!;
-        return new JsonObject { ["job"] = "IDENT", ["sets"] = Results.ValueSets(sets) };
+        return new JsonObject { ["job"] = "IDENT", ["sgbd"] = catalog.SgbdFile, ["sets"] = Results.ValueSets(sets) };
     }
 
     JsonObject JobsList()

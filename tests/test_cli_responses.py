@@ -89,6 +89,18 @@ class ResponseTests(unittest.TestCase):
             cli.data("status")
         self.assertEqual((error.exception.code, error.exception.message), ("link", "EDIABAS_IFH_0009"))
 
+    def test_autostart_warns_that_the_default_sgbd_is_in_use(self):
+        # options from an earlier `daemon start --sgbd X` (one that failed, say) are not carried over
+        with FakeDaemon(self.path, b'{"id": 1, "ok": true, "data": {}}\n'):
+            with patch.object(cli, "start_daemon", return_value=1234):
+                cli.data("ident")
+            self.assertEqual(len(cli.WARNINGS), 1)
+            self.assertIn("ms430ds0", cli.WARNINGS[0])
+            cli.WARNINGS.clear()
+            with patch.object(cli, "start_daemon", return_value=None):  # one was already running
+                cli.data("ident")
+            self.assertEqual(cli.WARNINGS, [])
+
     def test_reads_one_response_line(self):
         with FakeDaemon(self.path, b'{"id": 1, "ok": true, "data": {"a": 1}}\npartial next line'):
             self.assertEqual(cli.data("status"), {"a": 1})
