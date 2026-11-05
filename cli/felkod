@@ -72,7 +72,9 @@ def start_daemon(extra_args=()):
     if os.environ.get("FELKOD_PORT") and "--port" not in extra_args:
         extra_args += ["--port", os.environ["FELKOD_PORT"]]
     data_dir().mkdir(parents=True, exist_ok=True)
-    with open(data_dir() / "felkodd.log", "ab") as log:
+    log_path = data_dir() / "felkodd.log"
+    with open(log_path, "ab") as log:
+        log_start = log.tell()
         process = subprocess.Popen([str(DAEMON), "--socket", str(socket_path()), *extra_args], stdin=subprocess.DEVNULL,
                                    stdout=log, stderr=log, start_new_session=True)
     deadline = time.monotonic() + 15
@@ -84,13 +86,29 @@ def start_daemon(extra_args=()):
             # which listens moments later; only if none does is this a failed start
             deadline = min(deadline, time.monotonic() + 2)
         time.sleep(0.1)
-    raise Failure("daemon_start_failed", f"felkodd did not come up; see {data_dir() / 'felkodd.log'}")
+    reason = last_log_line(log_path, log_start)
+    raise Failure("daemon_start_failed", f"felkodd did not come up{': ' + reason if reason else ''}; see {log_path}")
+
+
+def last_log_line(path, start):
+    """The last line felkodd wrote to its log after offset start (its reason for exiting), or None."""
+    try:
+        with open(path, "rb") as log:
+            log.seek(start)
+            lines = log.read(65536).decode(errors="replace").splitlines()
+    except OSError:
+        return None
+    line = next((line.strip() for line in reversed(lines) if line.strip()), None)
+    return line.removeprefix("felkodd: ") if line else None
 
 
 def data(method, params=None, *, autostart=True):
     """Calls the daemon and returns its data, raising Failure on an error response."""
-    if autostart:
-        start_daemon()
+    if autostart and start_daemon() is not None:
+        # Options from an earlier `daemon start` do not carry over, so make the switch visible:
+        # otherwise a reply from the default ECU can pass for one from the ECU asked for before.
+        WARNINGS.append("felkodd was not running and was started with its defaults (SGBD ms430ds0); "
+                        "for another ECU: felkod daemon start --sgbd NAME")
     request = json.dumps({"id": 1, "method": method, "params": params or {}}) + "\n"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:

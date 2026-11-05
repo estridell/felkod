@@ -88,6 +88,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "daemon_start_failed")
         self.assertLess(cli.time.monotonic() - started, 5)
 
+    def test_failed_start_reports_why_felkodd_exited(self):
+        log = self.root / "felkod" / "felkodd.log"
+        log.parent.mkdir(parents=True)
+        log.write_bytes(b"felkodd: an earlier run's reason\n")
+
+        def popen(command, stdout, **kwargs):
+            stdout.write(b"felkodd: g_airbag is a group file (.grp), not an SGBD\n")
+            stdout.flush()
+            return FakeProcess()
+
+        with patch.object(cli, "DAEMON", Path(sys.executable)), patch.object(cli.subprocess, "Popen", side_effect=popen), \
+                patch.object(cli, "daemon_running", return_value=False), self.assertRaises(cli.Failure) as error:
+            cli.start_daemon(["--sgbd", "g_airbag"])
+        self.assertEqual(error.exception.code, "daemon_start_failed")
+        self.assertIn("g_airbag is a group file", error.exception.message)
+        self.assertNotIn("earlier run", error.exception.message)
+
     def test_one_shot_read_forwards_native_options(self):
         args = cli.build_parser().parse_args(["read", "STATUS_TEST", "--native", "--gap-ms", "42"])
         with patch.object(cli, "data", return_value={}) as data:
