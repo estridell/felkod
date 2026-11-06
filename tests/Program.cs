@@ -82,6 +82,20 @@ try
     var handlers = new Handlers(config, bus, catalog, () => { });
     async Task<JsonNode?> Call(string method, JsonObject? p = null) => await handlers.Call(method, p ?? new(), new());
 
+    // KWP2000* replies are checked against their own length byte, so a fault read can shrink to
+    // "no faults" after a clear (car: 22 bytes with 5 faults, then B8 F1 29 02 58 00 3A).
+    {
+        var kwpGuard = new ReplyGuard(catalog);
+        byte[] fsRequest = Convert.FromHexString("B829F1041802FFFF7E");
+        byte[] fiveFaults = Convert.FromHexString("B8F1291158055E19A05E14A05E1FA05E16205DF5A0A0");
+        kwpGuard.Check(fsRequest, fiveFaults);
+        kwpGuard.Learn(fsRequest, fiveFaults);
+        kwpGuard.Check(fsRequest, Convert.FromHexString("B8F1290258003A"));
+        checks++;
+        await Fails(() => { kwpGuard.Check(fsRequest, fiveFaults[..^2]); return Task.CompletedTask; },
+            "ecu_reply_length", "truncated KWP2000* reply");
+    }
+
     // The bus creates its EdiabasLib instance after the offline catalog, which binds EdiabasLib's
     // shared registers to it; every job must run on the registers of its own instance.
     var registers = ((Array)typeof(EdiabasNet).GetField("RegisterList", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null)!)

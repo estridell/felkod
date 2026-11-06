@@ -30,8 +30,21 @@ sealed class ReplyGuard(Catalog catalog)
 
     public void Check(byte[] request, byte[] response, bool ds2Status = true)
     {
+        if (IsKwp2000StarExchange(request, response))
+        {
+            // The frame carries its own length (format, target, source, length, data, checksum), and one
+            // request can legitimately get replies of different lengths: FS_LESEN is a single frame whose
+            // length grows with the fault count. So check the frame against itself, not earlier replies.
+            int framed = response[3] + 5;
+            if (response.Length != framed)
+            {
+                throw new FelkodException("ecu_reply_length",
+                    $"reply is {response.Length} bytes, its KWP2000* length byte says {framed}");
+            }
+            return;
+        }
         string text = catalog.StatusText(response[2]);
-        if (ds2Status && !IsKwp2000StarExchange(request, response) && !Results.IsOkStatus(text))
+        if (ds2Status && !Results.IsOkStatus(text))
         {
             throw new FelkodException("ecu_rejected", $"JOB_STATUS={text} (DS2 status {response[2]:X2})");
         }
