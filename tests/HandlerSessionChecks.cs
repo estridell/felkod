@@ -27,7 +27,8 @@ static class HandlerSessionChecks
         await Fails("job.run", new() { ["job"] = "TEST_PARL" }, "write_not_allowed", "write job requires allow_write");
         await Fails("log.start", new() { ["jobs"] = new JsonArray("TEST_PARL") }, "write_not_allowed", "logging refuses write job");
         await Fails("bench", new() { ["job"] = "TEST_PARL" }, "write_not_allowed", "benchmark refuses write job");
-        await Fails("faults.clear", new(), "confirm_required", "fault clear requires confirmation before bus access");
+        // cmd_test1 has neither FS_LESEN nor FS_LOESCHEN: refused by name, before confirmation or bus access
+        await Fails("faults.clear", new() { ["confirm"] = true }, "unknown_job", "fault clear needs the SGBD's fault jobs");
 
         // Several daemon sockets may log into the same data directory. All creators must own
         // separate directories, including when they choose their timestamp simultaneously.

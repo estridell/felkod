@@ -227,6 +227,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["error"]["code"], "io")
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_faults_clear_passes_the_voltage_options(self):
+        def sent(*argv):
+            with patch.object(cli, "data", return_value={}) as data:
+                cli.cmd_faults(cli.build_parser().parse_args(["faults", "clear", *argv]))
+            return data.call_args.args
+        self.assertEqual(sent("--confirm"), ("faults.clear", {"confirm": True, "allow_no_voltage": False}))
+        self.assertEqual(sent("--confirm", "--voltage-sgbd", "ms430ds0", "--allow-no-voltage"),
+                         ("faults.clear", {"confirm": True, "allow_no_voltage": True, "voltage_sgbd": "ms430ds0"}))
+
 
 if __name__ == "__main__":
     unittest.main()

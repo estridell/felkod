@@ -274,7 +274,10 @@ def cmd_ident(args):
 
 def cmd_faults(args):
     if args.action == "clear":
-        return data("faults.clear", {"confirm": args.confirm})
+        params = {"confirm": args.confirm, "allow_no_voltage": args.allow_no_voltage}
+        if args.voltage_sgbd:
+            params["voltage_sgbd"] = args.voltage_sgbd
+        return data("faults.clear", params)
     return data("faults.read")
 
 
@@ -440,6 +443,13 @@ def build_parser():
     p.add_argument("action", nargs="?", choices=["read", "clear"], default="read")
     p.add_argument("--confirm", action="store_true",
                    help="required for clear; the faults are saved to the audit log before clearing")
+    p.add_argument("--voltage-sgbd", metavar="SGBD",
+                   help="clear: read the battery voltage with STATUS_UBATT of this SGBD (another module "
+                        "on the bus) instead of the loaded one; clearing is refused below 11.5 V")
+    p.add_argument("--allow-no-voltage", action="store_true",
+                   help="clear: clear although no battery voltage can be read (the loaded SGBD has no "
+                        "STATUS_UBATT and no --voltage-sgbd is given); a voltage that can be read is "
+                        "still checked")
     p.set_defaults(func=cmd_faults)
 
     p = sub.add_parser("jobs", help="list the SGBD's jobs, or describe one (arguments, results, comments)")

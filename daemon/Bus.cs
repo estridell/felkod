@@ -69,6 +69,8 @@ sealed class Bus : IDisposable
     readonly Config config;
     readonly Catalog catalog;
     readonly ReplyGuard guard;
+    // Applied to every EdiabasLib instance last; tests point EdiabasLib's simulation at a .sim file with it.
+    readonly Action<EdiabasNet>? configureInstance;
     readonly BlockingCollection<Work> queue = new();
     readonly Thread worker;
     readonly Stopwatch jobClock = new();
@@ -82,10 +84,11 @@ sealed class Bus : IDisposable
     public LinkState Link { get; } = new();
     public LogRun? Log { get; private set; }
 
-    public Bus(Config config, Catalog catalog)
+    public Bus(Config config, Catalog catalog, Action<EdiabasNet>? configureInstance = null)
     {
         this.config = config;
         this.catalog = catalog;
+        this.configureInstance = configureInstance;
         guard = new ReplyGuard(catalog);
         traceDir = config.TraceDir;
         Directory.CreateDirectory(traceDir);
@@ -217,7 +220,34 @@ sealed class Bus : IDisposable
     public JsonArray RunJob(string job, string args = "")
     {
         EnsureInstance();
-        var e = ediabas!;
+        return RunOn(ediabas!, guard, job, args);
+    }
+
+    // Runs one job of another SGBD (faults.clear reads the battery voltage from another module this
+    // way) on an instance of its own, with that SGBD's status table for the reply check. The loaded
+    // SGBD's instance is closed first, as both use the one serial port; the next RunJob reopens it.
+    public JsonArray RunJobOf(string sgbd, Catalog other, string job, string args = "")
+    {
+        CloseNative();
+        DisposeInstance();
+        needsReset = true;
+        EdiabasNet e;
+        lock (Sgbd.Gate)
+        {
+            e = CreateInstance(sgbd);
+        }
+        try
+        {
+            return RunOn(e, new ReplyGuard(other), job, args);
+        }
+        finally
+        {
+            Dispose(e);
+        }
+    }
+
+    JsonArray RunOn(EdiabasNet e, ReplyGuard replyGuard, string job, string args)
+    {
         e.ArgString = args;
         Exception? failure = null;
         JsonArray? sets = null;
@@ -267,14 +297,14 @@ sealed class Bus : IDisposable
         if (observed.Exchanges.Count == 1)
         {
             var (request, response) = observed.Exchanges[0];
-            guard.Check(request, response);
+            replyGuard.Check(request, response);
         }
         Results.EnsureOkay(sets!);
         // Only a reply the job accepted sets the expected length.
         if (observed.Exchanges.Count == 1)
         {
             var (request, response) = observed.Exchanges[0];
-            guard.Learn(request, response);
+            replyGuard.Learn(request, response);
         }
         return sets!;
     }
@@ -381,12 +411,12 @@ sealed class Bus : IDisposable
         DisposeInstance();
         lock (Sgbd.Gate)
         {
-            ediabas = CreateInstance();
+            ediabas = CreateInstance(config.Sgbd);
         }
         needsReset = false;
     }
 
-    EdiabasNet CreateInstance()
+    EdiabasNet CreateInstance(string sgbd)
     {
         var e = new EdiabasNet();
         e.EdInterfaceClass = new ObservedObd { ComPort = config.Port };
@@ -399,25 +429,31 @@ sealed class Bus : IDisposable
         e.SetConfigProperty("IfhTraceBuffering", "0");
         e.NoInitForVJobs = true;
         e.AbortJobFunc = () => shuttingDown || (jobClock.IsRunning && jobClock.Elapsed.TotalSeconds > config.JobTimeoutS);
-        e.ResolveSgbdFile(config.Sgbd);
+        configureInstance?.Invoke(e);
+        e.ResolveSgbdFile(sgbd);
         return e;
     }
 
     void DisposeInstance()
     {
+        if (ediabas != null)
+        {
+            Dispose(ediabas);
+        }
+        ediabas = null;
+    }
+
+    static void Dispose(EdiabasNet instance)
+    {
         try
         {
             // Closes EdiabasLib's static serial port and stops its foreground comm thread.
-            if (ediabas != null)
-            {
-                Sgbd.Use(ediabas, ediabas.Dispose);
-            }
+            Sgbd.Use(instance, instance.Dispose);
         }
         catch (Exception)
         {
             // a half-dead instance has nothing left to save
         }
-        ediabas = null;
     }
 
     public void StartLog(LogRun run)
