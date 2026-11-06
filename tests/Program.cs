@@ -135,7 +135,14 @@ try
         Check((long)count.ExecuteScalar()! == 0, "log start not recorded as a pause");
     }
 
+    // faults.clear's battery voltage comes from STATUS_UBATT, which cmd_test1 lacks.
+    Check(Handlers.VoltageFrom("cmd_test1", catalog, own: false) == null, "no voltage source without STATUS_UBATT");
+    var dme = new Catalog(config with { Sgbd = "dm338ds1_interbyte" });
+    Check(Handlers.VoltageFrom("dm338ds1_interbyte", dme, own: true) is { Sgbd: "dm338ds1_interbyte", Own: true },
+        "voltage source from STATUS_UBATT");
+
     await HandlerSessionChecks.Run(config, handlers, Check);
+    await FaultsClearChecks.Run(config, Check);
     TransportChecks.Run(config, catalog, Check);
     await RpcChecks.Run(config, handlers, Check);
 

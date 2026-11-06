@@ -14,6 +14,10 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
 
     // Below this, clearing faults is refused: a sagging battery mid-write is how ECUs get confused.
     const double MinWriteVoltage = 11.5;
+    // STATUS_UBATT's battery voltage, by the names BMW's SGBDs give it.
+    static readonly string[] UbattResults = ["STAT_UBATT_WERT", "STATUS_UBATT_WERT"];
+    // Offline catalogs of the SGBDs named by voltage_sgbd, by name as given.
+    readonly Dictionary<string, Catalog> voltageCatalogs = new(StringComparer.OrdinalIgnoreCase);
 
     readonly DateTime startedAt = DateTime.UtcNow;
 
@@ -40,7 +44,7 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
         "jobs.describe" => JobsDescribe(Str(p, "job")),
         "job.run" => await JobRun(Str(p, "job"), OptStr(p, "args") ?? "", OptBool(p, "allow_write"), OptBool(p, "native"), Gap(p)),
         "faults.read" => await bus.Submit(() => FaultList(bus.RunJob("FS_LESEN"))),
-        "faults.clear" => await FaultsClear(OptBool(p, "confirm")),
+        "faults.clear" => await FaultsClear(OptBool(p, "confirm"), OptStr(p, "voltage_sgbd"), OptBool(p, "allow_no_voltage")),
         "log.start" => await LogStart(p, warnings),
         "bench" => await Bench(Str(p, "job"), p["n"]?.GetValue<int>() ?? 20, OptBool(p, "native"), Gap(p)),
         "ds2.request" => Ds2Request(Str(p, "job"), OptStr(p, "args") ?? ""),
@@ -194,25 +198,54 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
         return new JsonObject { ["job"] = "FS_LESEN", ["count"] = faults.Count, ["faults"] = faults };
     }
 
-    async Task<JsonNode?> FaultsClear(bool confirm)
+    // Where faults.clear reads the battery voltage: STATUS_UBATT of the loaded SGBD, or of the SGBD
+    // named by voltage_sgbd (another module on the bus), which runs on an EdiabasLib instance of its own.
+    // The interface cannot stand in: for a K+DCAN cable EdiabasLib reports a fixed ObdBatteryVoltage
+    // (12 V) whenever the cable sees pin 16, not a measurement.
+    internal sealed record VoltageSource(string Sgbd, Catalog Catalog, bool Own);
+
+    async Task<JsonNode?> FaultsClear(bool confirm, string? voltageSgbd, bool allowNoVoltage)
     {
+        catalog.RequireJobs(["FS_LESEN", "FS_LOESCHEN"]);
+        string module = catalog.SgbdFile;
+        var voltage = voltageSgbd == null ? VoltageFrom(config.Sgbd, catalog, own: false) : VoltageFrom(voltageSgbd);
+        if (voltage == null && !allowNoVoltage)
+        {
+            throw new FelkodException("no_voltage_source",
+                $"{module} has no STATUS_UBATT job with {string.Join(" or ", UbattResults)}, so the battery voltage cannot be " +
+                "checked before clearing; pass voltage_sgbd (the SGBD of another module on the bus that has one), " +
+                "or allow_no_voltage to clear without a voltage check");
+        }
         if (!confirm)
         {
-            throw new FelkodException("confirm_required", "clearing faults erases the DME's fault memory; pass confirm to proceed");
+            string check = voltage == null ? "without a battery voltage check" : $"after reading the battery voltage with STATUS_UBATT of {voltage.Catalog.SgbdFile}";
+            throw new FelkodException("confirm_required",
+                $"clearing faults erases the fault memory of the ECU that {module} addresses (FS_LOESCHEN, {check}); pass confirm to proceed");
         }
         return await bus.Submit(() =>
         {
-            var ubattSets = bus.RunJob("STATUS_UBATT");
-            double ubatt = ubattSets[1]!["STAT_UBATT_WERT"]!.GetValue<double>();
+            double? ubatt = voltage == null ? null : ReadVoltage(voltage);
             if (ubatt < MinWriteVoltage)
             {
-                throw new FelkodException("low_voltage", $"battery {ubatt:F2} V is below {MinWriteVoltage} V; charge it first");
+                throw new FelkodException("low_voltage",
+                    $"battery {ubatt:F2} V (STATUS_UBATT of {voltage!.Catalog.SgbdFile}) is below {MinWriteVoltage} V; " +
+                    $"{module} is not cleared; charge it first");
             }
             // The faults are saved to the audit log before the clear is sent, so clearing never loses them,
-            // even if the clear's reply is lost.
+            // even if the clear's reply is lost. All of FS_LESEN's sets are kept too: not every SGBD names
+            // its faults F_ORT_NR.
             var before = bus.RunJob("FS_LESEN");
             var faults = FaultList(before);
-            Audit("faults.clear", new JsonObject { ["stage"] = "sending", ["ubatt_v"] = ubatt, ["faults_before"] = faults.DeepClone() });
+            Audit("faults.clear", new JsonObject
+            {
+                ["stage"] = "sending",
+                ["sgbd"] = module,
+                ["voltage_checked"] = voltage != null,
+                ["ubatt_v"] = ubatt,
+                ["ubatt_sgbd"] = voltage?.Catalog.SgbdFile,
+                ["faults_before"] = faults.DeepClone(),
+                ["fs_lesen_sets"] = Results.ValueSets(before),
+            });
             try
             {
                 bus.RunJob("FS_LOESCHEN");
@@ -220,12 +253,82 @@ sealed class Handlers(Config config, Bus bus, Catalog catalog, Action requestShu
             catch (Exception ex)
             {
                 // the ECU may or may not have cleared; the audit says what is known
-                Audit("faults.clear", new JsonObject { ["stage"] = "failed", ["error"] = ex.Message });
+                Audit("faults.clear", new JsonObject { ["stage"] = "failed", ["sgbd"] = module, ["error"] = ex.Message });
                 throw;
             }
-            Audit("faults.clear", new JsonObject { ["stage"] = "done" });
-            return new JsonObject { ["cleared"] = true, ["ubatt_v"] = ubatt, ["faults_before"] = faults };
+            Audit("faults.clear", new JsonObject { ["stage"] = "done", ["sgbd"] = module });
+            return new JsonObject
+            {
+                ["cleared"] = true,
+                ["sgbd"] = module,
+                ["voltage_checked"] = voltage != null,
+                ["ubatt_v"] = ubatt,
+                ["ubatt_sgbd"] = voltage?.Catalog.SgbdFile,
+                ["faults_before"] = faults,
+            };
         });
+    }
+
+    // The SGBD named by voltage_sgbd must have a usable STATUS_UBATT; naming one is asking for it.
+    VoltageSource VoltageFrom(string sgbd)
+    {
+        if (sgbd.Length == 0 || sgbd.Contains('/'))
+        {
+            throw new FelkodException("bad_request", $"voltage_sgbd must be an SGBD name in the ECU path: {sgbd}");
+        }
+        Catalog source;
+        lock (voltageCatalogs)
+        {
+            if (!voltageCatalogs.TryGetValue(sgbd, out source!))
+            {
+                try
+                {
+                    source = new Catalog(config with { Sgbd = sgbd });
+                }
+                catch (Exception ex) when (ex is not FelkodException)
+                {
+                    throw new FelkodException("unknown_sgbd", $"voltage_sgbd {sgbd}: {ex.GetBaseException().Message}");
+                }
+                voltageCatalogs[sgbd] = source;
+            }
+        }
+        return VoltageFrom(sgbd, source, own: true)
+            ?? throw new FelkodException("no_voltage_source",
+                $"{source.SgbdFile} has no STATUS_UBATT job with {string.Join(" or ", UbattResults)}");
+    }
+
+    internal static VoltageSource? VoltageFrom(string sgbd, Catalog source, bool own)
+    {
+        if (!source.JobNames().Contains("STATUS_UBATT"))
+        {
+            return null;
+        }
+        // An SGBD that describes STATUS_UBATT's results must name the voltage among them; one without
+        // result descriptions is checked on the reply.
+        var described = source.Run("_RESULTS", "STATUS_UBATT").Skip(1)
+            .Select(set => set!["RESULT"]?.GetValue<string>()).OfType<string>().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return described.Count > 0 && !UbattResults.Any(described.Contains) ? null : new VoltageSource(sgbd, source, own);
+    }
+
+    // On the bus thread. Only a number in volts counts as a reading.
+    double ReadVoltage(VoltageSource source)
+    {
+        var sets = source.Own ? bus.RunJobOf(source.Sgbd, source.Catalog, "STATUS_UBATT") : bus.RunJob("STATUS_UBATT");
+        var set = sets[1]!.AsObject();
+        string from = $"STATUS_UBATT of {source.Catalog.SgbdFile}";
+        // a result that comes with its unit first, so the unit can be checked
+        string result = UbattResults.FirstOrDefault(name => set.ContainsKey(name) && Results.UnitOf(set, name) != null)
+            ?? UbattResults.FirstOrDefault(set.ContainsKey)
+            ?? throw new FelkodException("bad_voltage", $"{from} returned none of {string.Join(", ", UbattResults)}");
+        if (set[result] is not JsonValue value || !value.TryGetValue(out double volts) || !double.IsFinite(volts))
+        {
+            throw new FelkodException("bad_voltage", $"{from} returned no number in {result}: {set[result]?.ToJsonString() ?? "null"}");
+        }
+        if (Results.UnitOf(set, result) is string unit && !unit.Trim().Equals("V", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new FelkodException("bad_voltage", $"{from} returned {result} in {unit}, not V");
+        }
+        return volts;
     }
 
     async Task<JsonNode?> LogStart(JsonObject p, JsonArray warnings)

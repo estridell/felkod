@@ -88,8 +88,13 @@ are refused. Sessions and traces can contain the car's VIN.
 - Read-only jobs are `STATUS_*`, `LESEN_*`, `*_LESEN`, `IDENT`, `IDENT_AIF`, `INFO`, `ECU_CONFIG` and
   EDIABAS's metadata jobs (`_JOBS`, `_TABLE`, ...), by name. Every other job (`STEUERN_*`, `*_LOESCHEN`,
   `*_PROGRAMMIEREN`, other `_*` jobs, ...) needs `--allow-write`.
-- `faults clear` needs `--confirm`, refuses below 11.5 V battery, and saves the faults to
-  `~/.local/share/felkod/audit.jsonl` before clearing; every write is recorded there.
+- `faults clear` needs `--confirm` and clears the ECU that the loaded SGBD addresses. It first reads the
+  battery voltage with `STATUS_UBATT` of the loaded SGBD, or of `--voltage-sgbd SGBD` (another module on
+  the bus: many SGBDs, e.g. `MRS4` for the E46 airbag module, have no `STATUS_UBATT`), and refuses below
+  11.5 V. With no voltage source it refuses unless `--allow-no-voltage` is given; a voltage that can be
+  read is always checked. The cable's own reading is not used: for a K+DCAN cable EdiabasLib reports a
+  fixed 12 V. The faults (all of FS_LESEN's results) are saved to `~/.local/share/felkod/audit.jsonl`
+  before clearing; every write is recorded there.
 - `ds2 raw` sends only telegrams that a read-only SGBD job sends, unless `--allow-write`.
 - Replies to single-telegram jobs are only decoded when their DS2 status is OK by BMW's own status table
   and their length matches earlier good replies to the same request, so a rejected or truncated reply
@@ -100,8 +105,8 @@ are refused. Sessions and traces can contain the car's VIN.
 
 ## Development
 
-The checks CI runs, without a car, a cable or BMW files (they use EdiabasLib's own test SGBDs and a
-pseudo-terminal as the ECU):
+The checks CI runs, without a car, a cable or BMW files (they use EdiabasLib's own test SGBDs, with a
+pseudo-terminal or EdiabasLib's simulation as the ECU):
 
 ```
 dotnet build -c Release daemon

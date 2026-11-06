@@ -88,15 +88,24 @@ options:
 ## felkod faults
 
 ```
-usage: felkod faults [-h] [--confirm] [{read,clear}]
+usage: felkod faults [-h] [--confirm] [--voltage-sgbd SGBD]
+                     [--allow-no-voltage]
+                     [{read,clear}]
 
 positional arguments:
   {read,clear}
 
 options:
-  -h, --help    show this help message and exit
-  --confirm     required for clear; the faults are saved to the audit log
-                before clearing
+  -h, --help           show this help message and exit
+  --confirm            required for clear; the faults are saved to the audit
+                       log before clearing
+  --voltage-sgbd SGBD  clear: read the battery voltage with STATUS_UBATT of
+                       this SGBD (another module on the bus) instead of the
+                       loaded one; clearing is refused below 11.5 V
+  --allow-no-voltage   clear: clear although no battery voltage can be read
+                       (the loaded SGBD has no STATUS_UBATT and no --voltage-
+                       sgbd is given); a voltage that can be read is still
+                       checked
 ```
 
 ## felkod jobs
