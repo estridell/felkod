@@ -4,8 +4,10 @@ namespace Felkod.Daemon;
 
 // One rule for both transports, applied to jobs that send a single telegram (multi-telegram jobs
 // such as FS_LESEN legitimately get replies whose length varies with the fault count):
-// - the reply's DS2 status must be one BMW's JOBRESULT table calls OKAY or "data valid": some SGBD
-//   jobs report OKAY (with zeros) for a rejected reply;
+// - for DS1/DS2 (concept 0x0005/0x0006), the reply's status byte must be one BMW's JOBRESULT table
+//   calls OKAY or "data valid": some SGBD jobs report OKAY (with zeros) for a rejected reply. Other
+//   concepts have no status byte there (in KWP2000* byte 2 is the ECU's address), so for them only
+//   the SGBD's own JOB_STATUS decides;
 // - the reply must be as long as earlier good replies to the same request: the SGBD does not check
 //   lengths, so a short reply would decode into invented values.
 sealed class ReplyGuard(Catalog catalog)
@@ -13,10 +15,15 @@ sealed class ReplyGuard(Catalog catalog)
     readonly Dictionary<string, int> lengths = new();
     readonly object gate = new();
 
-    public void Check(byte[] request, byte[] response)
+    // Whether a reply under this EdiabasLib CommParameter carries a DS2-style status in byte 2.
+    // Unknown (no parameters yet) counts as DS2, the stricter choice.
+    public static bool HasDs2Status(uint[]? commParameter) =>
+        commParameter is not { Length: > 0 } || commParameter[0] is 0x0005 or 0x0006;
+
+    public void Check(byte[] request, byte[] response, bool ds2Status = true)
     {
         string text = catalog.StatusText(response[2]);
-        if (!Results.IsOkStatus(text))
+        if (ds2Status && !Results.IsOkStatus(text))
         {
             throw new FelkodException("ecu_rejected", $"JOB_STATUS={text} (DS2 status {response[2]:X2})");
         }
@@ -44,7 +51,7 @@ sealed class ReplyGuard(Catalog catalog)
 // ReplyGuard can check jobs that go through EdiabasLib too.
 sealed class ObservedObd : EdInterfaceObd
 {
-    public List<(byte[] Request, byte[] Response)> Exchanges { get; } = new();
+    public List<(byte[] Request, byte[] Response, bool Ds2Status)> Exchanges { get; } = new();
 
     public override bool TransmitData(byte[] sendData, out byte[] receiveData)
     {
@@ -52,7 +59,7 @@ sealed class ObservedObd : EdInterfaceObd
         bool ok = base.TransmitData(sendData, out receiveData);
         if (ok && receiveData is { Length: >= 4 })
         {
-            Exchanges.Add((request, receiveData.ToArray()));
+            Exchanges.Add((request, receiveData.ToArray(), ReplyGuard.HasDs2Status(CommParameter)));
         }
         return ok;
     }

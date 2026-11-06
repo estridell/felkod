@@ -97,7 +97,8 @@ are refused. Sessions and traces can contain the car's VIN.
   before clearing; every write is recorded there.
 - `ds2 raw` sends only telegrams that a read-only SGBD job sends, unless `--allow-write`.
 - Replies to single-telegram jobs are only decoded when their DS2 status is OK by BMW's own status table
-  and their length matches earlier good replies to the same request, so a rejected or truncated reply
+  (DS1/DS2 modules; KWP2000 modules such as the E46 DSC MK60 have no status byte there, so their SGBD's
+  JOB_STATUS decides) and their length matches earlier good replies to the same request, so a rejected or truncated reply
   never becomes data. The expected length is learned from the first good reply, so a short first reply
   is not caught. Offline `ds2 decode` also checks lengths already learned from live replies; supplied
   offline replies do not establish expected lengths.
