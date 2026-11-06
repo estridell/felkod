@@ -6,8 +6,9 @@ namespace Felkod.Daemon;
 // such as FS_LESEN legitimately get replies whose length varies with the fault count):
 // - for DS1/DS2 (concept 0x0005/0x0006), the reply's status byte must be one BMW's JOBRESULT table
 //   calls OKAY or "data valid": some SGBD jobs report OKAY (with zeros) for a rejected reply. Other
-//   concepts have no status byte there (in KWP2000* byte 2 is the ECU's address), so for them only
-//   the SGBD's own JOB_STATUS decides;
+//   concepts, and KWP2000* frames that an SGBD sends over the DS2 concept itself (the E46 DSC MK60
+//   does: B8 29 F1 .. / B8 F1 29 ..), have no status byte there (byte 2 is the ECU's address), so
+//   for them only the SGBD's own JOB_STATUS decides;
 // - the reply must be as long as earlier good replies to the same request: the SGBD does not check
 //   lengths, so a short reply would decode into invented values.
 sealed class ReplyGuard(Catalog catalog)
@@ -20,10 +21,17 @@ sealed class ReplyGuard(Catalog catalog)
     public static bool HasDs2Status(uint[]? commParameter) =>
         commParameter is not { Length: > 0 } || commParameter[0] is 0x0005 or 0x0006;
 
+    // A KWP2000* exchange: format byte with address mode, tester F1 as source, and the reply addressed
+    // back to F1 from the ECU the request went to. A DS2 reply would need a length of 0xF1 and a status
+    // equal to the request's length byte to look like this.
+    public static bool IsKwp2000StarExchange(byte[] request, byte[] response) =>
+        request.Length >= 4 && response.Length >= 4 && request[0] >= 0x80 && request[2] == 0xF1
+        && response[0] >= 0x80 && response[1] == 0xF1 && response[2] == request[1];
+
     public void Check(byte[] request, byte[] response, bool ds2Status = true)
     {
         string text = catalog.StatusText(response[2]);
-        if (ds2Status && !Results.IsOkStatus(text))
+        if (ds2Status && !IsKwp2000StarExchange(request, response) && !Results.IsOkStatus(text))
         {
             throw new FelkodException("ecu_rejected", $"JOB_STATUS={text} (DS2 status {response[2]:X2})");
         }

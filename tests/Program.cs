@@ -46,6 +46,21 @@ try
     Check(ReplyGuard.HasDs2Status(null) && ReplyGuard.HasDs2Status([]), "unknown concept counts as DS2");
     foreach (uint concept in new uint[] { 0x010C, 0x010D, 0x010F, 0x0110, 0x0001 })
         Check(!ReplyGuard.HasDs2Status([concept]), $"concept {concept:X4} has no DS2 status byte");
+
+    // KWP2000* frames sent over the DS2 concept (E46 DSC MK60, from a car trace): byte 2 is the address.
+    byte[] kwpIdent = Convert.FromHexString("B829F1021A80F8");
+    Check(ReplyGuard.IsKwp2000StarExchange(kwpIdent,
+        Convert.FromHexString("B8F1291F5A80000006759045040400060006200204032400000000005D0000000000005F")),
+        "MK60 IDENT is a KWP2000* exchange");
+    Check(ReplyGuard.IsKwp2000StarExchange(Convert.FromHexString("B829F1041802FFFF7E"),
+        Convert.FromHexString("B8F1291158055E19A05E14A05E1FA05E16205DF5A0A0")), "MK60 FS_LESEN is a KWP2000* exchange");
+    Check(!ReplyGuard.IsKwp2000StarExchange(kwpIdent, Convert.FromHexString("B8F12A1F5A80")),
+        "a reply from another address is not");
+    // DS2, including addresses >= 0x80 (KOMBI46): the status byte still counts.
+    Check(!ReplyGuard.IsKwp2000StarExchange(Convert.FromHexString("80040084"), Convert.FromHexString("8018A0FFFF")),
+        "KOMBI46 DS2 is not KWP2000*");
+    Check(!ReplyGuard.IsKwp2000StarExchange(Convert.FromHexString("12050B031F"), Convert.FromHexString("1205A2B5")),
+        "a rejected DS2 reply is not KWP2000*");
     Check(JobRules.IsMetadataJob("_tables") && !JobRules.IsMetadataJob("_RESET"), "metadata jobs");
 
     foreach (string invalid in new[] { "0", "-1", "NaN", "Infinity", "abc" })
