@@ -15,23 +15,26 @@ static class FaultsClearChecks
 
     public static async Task Run(Config testConfig, Action<bool, string> check)
     {
-        async Task<Outcome> Clear(JsonObject p, byte volts = Volts12_26, byte clearStatus = 0xA0)
+        // thenUbatt: a second faults.clear with the same request, after STATUS_UBATT's reply became this one;
+        // the outcome is the second call's
+        async Task<Outcome> Clear(JsonObject p, byte volts = Volts12_26, byte clearStatus = 0xA0, string? thenUbatt = null)
         {
             string dir = Path.Combine(testConfig.DataDir, "faults-clear-" + Guid.NewGuid().ToString("N"));
             string sim = Path.Combine(dir, "sim");
             Directory.CreateDirectory(sim);
             // requests without their checksum, replies with it; one stored fault
-            File.WriteAllText(Path.Combine(sim, "obd.sim"), $"""
+            void Simulate(string ubatt) => File.WriteAllText(Path.Combine(sim, "obd.sim"), $"""
                 [REQUEST]
                 UBATT_0=12,09,06,00,00,00,D8,02
                 FS_LESEN_0=12,05,04,01
                 FS_LOESCHEN_0=12,04,05
 
                 [RESPONSE]
-                UBATT_0={Telegram(0x12, 0xA0, volts, 0x00)}
+                UBATT_0={ubatt}
                 FS_LESEN_0={Telegram(0x12, 0xA0, 0x01, 0x00, 0x00, 0x00)}
                 FS_LOESCHEN_0={Telegram(0x12, clearStatus)}
                 """);
+            Simulate(Telegram(0x12, 0xA0, volts, 0x00));
             var config = testConfig with { Sgbd = Sgbd, DataDir = dir };
             var catalog = new Catalog(config);
             var bus = new Bus(config, catalog, e =>
@@ -46,9 +49,16 @@ static class FaultsClearChecks
             try
             {
                 result = await handlers.Call("faults.clear", p, new());
+                if (thenUbatt != null)
+                {
+                    // each read opens a new instance, which loads the simulation afresh
+                    Simulate(thenUbatt);
+                    result = await handlers.Call("faults.clear", p, new());
+                }
             }
             catch (FelkodException ex)
             {
+                result = null;
                 error = ex;
             }
             bus.Stop();
@@ -86,6 +96,10 @@ static class FaultsClearChecks
         var other = await Clear(new() { ["confirm"] = true, ["voltage_sgbd"] = Sgbd });
         check(other.Result?["ubatt_sgbd"]?.GetValue<string>() == SgbdFile && Sent(other, "STATUS_UBATT", "FS_LESEN", "FS_LOESCHEN")
             && other.Audit[0]["ubatt_sgbd"]!.GetValue<string>() == SgbdFile, "voltage from a named SGBD on its own instance");
+        // a status-only reply would decode its checksum as a voltage; it is shorter than the good one before
+        var otherShort = await Clear(new() { ["confirm"] = true, ["voltage_sgbd"] = Sgbd }, thenUbatt: Telegram(0x12, 0xA0));
+        check(Refused(otherShort, "ecu_reply_length") && otherShort.Audit.Count == 2,
+            "a named SGBD's voltage reply is length-checked against earlier ones");
         var otherLow = await Clear(new() { ["confirm"] = true, ["voltage_sgbd"] = Sgbd }, volts: Volts8_72);
         check(Refused(otherLow, "low_voltage") && Sent(otherLow, "STATUS_UBATT"), "low voltage from a named SGBD refused");
 

@@ -69,6 +69,8 @@ sealed class Bus : IDisposable
     readonly Config config;
     readonly Catalog catalog;
     readonly ReplyGuard guard;
+    // RunJobOf's reply guards, one per other SGBD, so their replies are length-checked across instances.
+    readonly Dictionary<Catalog, ReplyGuard> otherGuards = new();
     // Applied to every EdiabasLib instance last; tests point EdiabasLib's simulation at a .sim file with it.
     readonly Action<EdiabasNet>? configureInstance;
     readonly BlockingCollection<Work> queue = new();
@@ -238,7 +240,11 @@ sealed class Bus : IDisposable
         }
         try
         {
-            return RunOn(e, new ReplyGuard(other), job, args);
+            if (!otherGuards.TryGetValue(other, out var otherGuard))
+            {
+                otherGuards[other] = otherGuard = new ReplyGuard(other);
+            }
+            return RunOn(e, otherGuard, job, args);
         }
         finally
         {
