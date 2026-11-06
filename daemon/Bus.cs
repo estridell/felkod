@@ -302,14 +302,14 @@ sealed class Bus : IDisposable
         }
         if (observed.Exchanges.Count == 1)
         {
-            var (request, response) = observed.Exchanges[0];
-            replyGuard.Check(request, response);
+            var (request, response, ds2Status) = observed.Exchanges[0];
+            replyGuard.Check(request, response, ds2Status);
         }
         Results.EnsureOkay(sets!);
         // Only a reply the job accepted sets the expected length.
         if (observed.Exchanges.Count == 1)
         {
-            var (request, response) = observed.Exchanges[0];
+            var (request, response, _) = observed.Exchanges[0];
             replyGuard.Learn(request, response);
         }
         return sets!;

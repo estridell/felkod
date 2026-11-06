@@ -38,6 +38,14 @@ try
         Check(JobRules.IsReadOnlyJob(job), $"{job} read-only");
     foreach (string job in new[] { "_RESET", "STEUERN_TEST", "FS_LOESCHEN", "TEST_PARL", "IDENTX" })
         Check(!JobRules.IsReadOnlyJob(job), $"{job} not read-only");
+
+    // DS2 status byte only for DS1/DS2; KWP2000* (byte 2 = ECU address, e.g. 0x29 for DSC MK60) and
+    // other concepts rely on the SGBD's JOB_STATUS. No parameters yet counts as DS2 (stricter).
+    Check(ReplyGuard.HasDs2Status([0x0006, 9600]), "DS2 has a status byte");
+    Check(ReplyGuard.HasDs2Status([0x0005]), "DS1 has a status byte");
+    Check(ReplyGuard.HasDs2Status(null) && ReplyGuard.HasDs2Status([]), "unknown concept counts as DS2");
+    foreach (uint concept in new uint[] { 0x010C, 0x010D, 0x010F, 0x0110, 0x0001 })
+        Check(!ReplyGuard.HasDs2Status([concept]), $"concept {concept:X4} has no DS2 status byte");
     Check(JobRules.IsMetadataJob("_tables") && !JobRules.IsMetadataJob("_RESET"), "metadata jobs");
 
     foreach (string invalid in new[] { "0", "-1", "NaN", "Infinity", "abc" })
